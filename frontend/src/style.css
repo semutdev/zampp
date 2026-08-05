@@ -1,0 +1,208 @@
+:root {
+    --bg-window: #f5f5f7;
+    --bg-panel: #ffffff;
+    --border-color: #d2d2d7;
+    --text-main: #1d1d1f;
+    --text-muted: #86868b;
+
+    --btn-bg: #ffffff;
+    --btn-border: #c4c4c6;
+    --btn-hover: #f0f0f0;
+
+    --light-off: #d1d5db;
+    --light-on: #34c759;
+    --light-on-glow: rgba(52, 199, 89, 0.4);
+
+    --danger: #d93025;
+    --accent: #60a5fa;
+    --accent-hover: #3b82f6;
+}
+
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+html, body {
+    background-color: var(--bg-window);
+    color: var(--text-main);
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    padding: 0;
+    display: flex;
+    justify-content: center;
+    user-select: none;
+    cursor: default;
+}
+
+#app {
+    width: 100%;
+    max-width: 460px;
+}
+
+/* ===== Window shell ===== */
+.app-window {
+    background-color: var(--bg-panel);
+    border: 1px solid var(--border-color);
+    border-radius: 0;
+    box-shadow: none;
+    overflow: hidden;
+}
+
+.header {
+    text-align: center;
+    padding: 10px 12px;
+    background-color: var(--bg-window);
+    border-bottom: 1px solid var(--border-color);
+}
+
+.header h1 {
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.header .subtitle {
+    font-size: 10px;
+    color: var(--text-muted);
+    font-weight: 400;
+    margin-top: 2px;
+}
+
+/* ===== Service row ===== */
+.service-row {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border-color);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.service-info {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    flex: 1;
+}
+
+.status-light {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background-color: var(--light-off);
+    box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.2);
+    margin-top: 3px;
+    flex-shrink: 0;
+}
+
+.status-light.on {
+    background-color: var(--light-on);
+    box-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.5),
+        0 0 6px var(--light-on-glow);
+}
+
+.details {
+    flex: 1;
+}
+
+.service-name {
+    font-size: 12px;
+    font-weight: 600;
+    margin-bottom: 4px;
+}
+
+.controls {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 2px;
+}
+
+select {
+    font-family: inherit;
+    font-size: 11px;
+    padding: 3px 6px;
+    border: 1px solid var(--border-color);
+    border-radius: 5px;
+    background-color: #fff;
+    outline: none;
+    color: var(--text-main);
+}
+
+select:disabled {
+    background-color: #f0f0f0;
+    color: #a0a0a0;
+}
+
+.port-info {
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-top: 4px;
+}
+
+/* ===== Buttons ===== */
+.btn {
+    background-color: var(--btn-bg);
+    border: 1px solid var(--btn-border);
+    border-radius: 5px;
+    padding: 4px 12px;
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--text-main);
+    cursor: pointer;
+    min-width: 64px;
+    transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.btn:hover:not(:disabled) {
+    background-color: var(--btn-hover);
+}
+
+.btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.btn.stop-btn {
+    color: var(--danger);
+    border-color: var(--danger);
+}
+
+.btn.stop-btn:hover:not(:disabled) {
+    background-color: rgba(217, 48, 37, 0.08);
+}
+
+/* ===== Toolbar ===== */
+.toolbar {
+    background-color: var(--bg-window);
+    padding: 8px 12px;
+    display: flex;
+    gap: 6px;
+}
+
+.btn-tool {
+    flex: 1;
+    padding: 6px 4px;
+    font-size: 11px;
+    min-width: 0;
+}
+
+/* ===== Toast / message ===== */
+.toast {
+    padding: 6px 12px;
+    font-size: 11px;
+    border-top: 1px solid var(--border-color);
+    background-color: var(--bg-window);
+    color: var(--text-muted);
+    word-break: break-word;
+    display: none;
+}
+
+.toast.show {
+    display: block;
+}
+
+.toast.error {
+    color: var(--danger);
+}
