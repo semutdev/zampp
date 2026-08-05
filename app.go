@@ -1,14 +1,19 @@
 package main
 
 import (
+	"archive/zip"
 	"context"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/user"
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 // App struct
@@ -108,6 +113,252 @@ func phpBaseDir() (string, error) {
 		return "", err
 	}
 	return filepath.Join(root, "bin", "php"), nil
+}
+
+// CheckFirstRun reports whether the ZAMPP binaries have already been set up
+// in ~/.zampp/bin/php. Returns true if installed, false if first run / not
+// yet downloaded. The frontend uses this to decide whether to show the
+// setup/download overlay.
+func (a *App) CheckFirstRun() bool {
+	phpDir, err := phpBaseDir()
+	if err != nil {
+		return false
+	}
+	info, err := os.Stat(phpDir)
+	if err != nil {
+		return false
+	}
+	return info.IsDir()
+}
+
+// binariesZipURL is the GitHub release URL for the ZAMPP engine bundle
+// (contains .zampp/bin and .zampp/conf at the archive root).
+const binariesZipURL = "https://github.com/semutdev/zampp/releases/download/v1.0.0/zampp-mac-x64-v1.zip"
+
+// DownloadAndExtractBinaries downloads the engine zip from GitHub releases,
+// streaming 'download-progress' events (0-100) to the frontend, then
+// extracts it into the user's home directory. Because the zip already
+// contains the .zampp/ root folder, extraction lands at ~/.zampp/bin and
+// ~/.zampp/conf. The temporary download at /tmp/zampp-engine.zip is
+// deleted at the end, and a 'download-complete' event is emitted.
+func (a *App) DownloadAndExtractBinaries() error {
+	if a.ctx == nil {
+		return fmt.Errorf("app context not initialized")
+	}
+
+	const tmpZip = "/tmp/zampp-engine.zip"
+
+	// 1) Download with progress streaming.
+	total, err := a.downloadWithProgress(binariesZipURL, tmpZip, "download-progress")
+	if err != nil {
+		return err
+	}
+	_ = total
+	runtime.EventsEmit(a.ctx, "download-progress", 100)
+
+	// 2) Extract zip into home directory (zip already contains .zampp/ root).
+	home, err := homeDir()
+	if err != nil {
+		return fmt.Errorf("cannot resolve home dir: %w", err)
+	}
+	if err := extractZipToDir(tmpZip, home); err != nil {
+		return fmt.Errorf("extract failed: %w", err)
+	}
+
+	// 3) Cleanup temp file.
+	_ = os.Remove(tmpZip)
+
+	// 4) Notify frontend.
+	runtime.EventsEmit(a.ctx, "download-complete")
+	return nil
+}
+
+// downloadWithProgress downloads url to destPath, emitting progress events
+// (0-100) on the given eventName as bytes stream in. Returns the
+// ContentLength (may be -1 if unknown).
+func (a *App) downloadWithProgress(url, destPath, eventName string) (int64, error) {
+	if a.ctx == nil {
+		return -1, fmt.Errorf("app context not initialized")
+	}
+
+	req, err := http.NewRequestWithContext(a.ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return -1, fmt.Errorf("failed to create request: %w", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return -1, fmt.Errorf("failed to download: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return -1, fmt.Errorf("download failed: HTTP %d", resp.StatusCode)
+	}
+
+	total := resp.ContentLength
+	out, err := os.Create(destPath)
+	if err != nil {
+		return total, fmt.Errorf("cannot create temp file %s: %w", destPath, err)
+	}
+
+	var downloaded int64
+	buf := make([]byte, 32*1024)
+	lastPct := -1
+	for {
+		n, readErr := resp.Body.Read(buf)
+		if n > 0 {
+			if _, werr := out.Write(buf[:n]); werr != nil {
+				out.Close()
+				return total, fmt.Errorf("write error: %w", werr)
+			}
+			downloaded += int64(n)
+			if total > 0 {
+				pct := int(float64(downloaded) / float64(total) * 100)
+				if pct > lastPct && pct <= 100 {
+					lastPct = pct
+					runtime.EventsEmit(a.ctx, eventName, pct)
+				}
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			out.Close()
+			return total, fmt.Errorf("download read error: %w", readErr)
+		}
+	}
+	out.Close()
+	return total, nil
+}
+
+// CheckPHPVersion reports whether the given PHP version has been installed
+// under ~/.zampp/bin/php/{version}. Returns true if the directory exists,
+// false otherwise. The frontend uses this to decide whether the selected
+// version needs to be downloaded before starting the web server.
+func (a *App) CheckPHPVersion(version string) bool {
+	if version == "" {
+		return false
+	}
+	base, err := phpBaseDir()
+	if err != nil {
+		return false
+	}
+	info, err := os.Stat(filepath.Join(base, version))
+	if err != nil {
+		return false
+	}
+	return info.IsDir()
+}
+
+// phpVersionZipURL builds the GitHub Releases download URL for a per-version
+// PHP bundle. The archive is expected to contain a top-level folder named
+// {version} so that extraction into ~/.zampp/bin/php/ yields
+// ~/.zampp/bin/php/{version}.
+func phpVersionZipURL(version string) string {
+	return fmt.Sprintf("https://github.com/semutdev/zampp/releases/download/v1.0.0/php-%s.zip", version)
+}
+
+// DownloadPHPVersion downloads and extracts the per-version PHP bundle for the
+// given version (e.g. "8.2").
+//
+// Flow:
+//  1. Download https://github.com/semutdev/zampp/releases/download/v1.0.0/php-{version}.zip
+//     to /tmp/php-{version}.zip, emitting 'php-download-progress' (0-100).
+//  2. Extract into ~/.zampp/bin/php/ (zip already contains a top-level {version} folder).
+//  3. Delete /tmp/php-{version}.zip.
+//  4. Emit 'php-download-complete'.
+//
+// The base engine (DownloadAndExtractBinaries) is independent and remains
+// unchanged — it runs only on First Run.
+func (a *App) DownloadPHPVersion(version string) error {
+	if version == "" {
+		return fmt.Errorf("version is empty")
+	}
+	if a.ctx == nil {
+		return fmt.Errorf("app context not initialized")
+	}
+
+	base, err := phpBaseDir()
+	if err != nil {
+		return fmt.Errorf("cannot resolve php base dir: %w", err)
+	}
+	if err := os.MkdirAll(base, 0755); err != nil {
+		return fmt.Errorf("cannot create php base dir %s: %w", base, err)
+	}
+
+	tmpZip := fmt.Sprintf("/tmp/php-%s.zip", version)
+	url := phpVersionZipURL(version)
+
+	// 1) Download with progress streaming.
+	total, err := a.downloadWithProgress(url, tmpZip, "php-download-progress")
+	if err != nil {
+		return err
+	}
+	_ = total
+	runtime.EventsEmit(a.ctx, "php-download-progress", 100)
+
+	// 2) Extract into ~/.zampp/bin/php/.
+	if err := extractZipToDir(tmpZip, base); err != nil {
+		return fmt.Errorf("extract failed: %w", err)
+	}
+
+	// 3) Cleanup temp file.
+	_ = os.Remove(tmpZip)
+
+	// 4) Notify frontend.
+	runtime.EventsEmit(a.ctx, "php-download-complete")
+	return nil
+}
+
+// extractZipToDir extracts all entries of the zip archive at zipPath into
+// destDir, preserving the archive's internal directory structure.
+func extractZipToDir(zipPath, destDir string) error {
+	r, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return fmt.Errorf("cannot open zip: %w", err)
+	}
+	defer r.Close()
+
+	for _, f := range r.File {
+		target := filepath.Join(destDir, f.Name)
+
+		// Zip slip protection: ensure target stays within destDir.
+		if !strings.HasPrefix(filepath.Clean(target)+string(os.PathSeparator), filepath.Clean(destDir)+string(os.PathSeparator)) {
+			return fmt.Errorf("zip entry outside destination dir: %s", f.Name)
+		}
+
+		if f.FileInfo().IsDir() {
+			if err := os.MkdirAll(target, 0755); err != nil {
+				return fmt.Errorf("cannot create dir %s: %w", target, err)
+			}
+			continue
+		}
+
+		if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+			return fmt.Errorf("cannot create parent dir for %s: %w", target, err)
+		}
+
+		rc, err := f.Open()
+		if err != nil {
+			return fmt.Errorf("cannot open zip entry %s: %w", f.Name, err)
+		}
+
+		out, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
+		if err != nil {
+			rc.Close()
+			return fmt.Errorf("cannot create %s: %w", target, err)
+		}
+
+		if _, err := io.Copy(out, rc); err != nil {
+			rc.Close()
+			out.Close()
+			return fmt.Errorf("cannot write %s: %w", target, err)
+		}
+		rc.Close()
+		out.Close()
+	}
+	return nil
 }
 
 // getPHPExecutablePath resolves the PHP binary path for the given version,

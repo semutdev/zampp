@@ -18,8 +18,9 @@ func main() {
 	// Create application with options
 	err := wails.Run(&options.App{
 		Title:  "ZAMPP",
-		Width:  460,
+		Width:  620,
 		Height: 360,
+		DisableResize: true,
 		AssetServer: &assetserver.Options{
 			Assets: assets,
 		},

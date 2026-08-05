@@ -1,5 +1,6 @@
 import './style.css';
 import './app.css';
+import zamppLogo from './assets/images/zampp-logo.png';
 import {
     StartWebServer,
     StopWebServer,
@@ -8,13 +9,35 @@ import {
     OpenAdminer,
     OpenHtdocsFolder,
     OpenWebRoot,
+    CheckFirstRun,
+    DownloadAndExtractBinaries,
+    CheckPHPVersion,
+    DownloadPHPVersion,
 } from '../wailsjs/go/main/App';
+import { EventsOn } from '../wailsjs/runtime/runtime';
 
 document.querySelector('#app').innerHTML = `
     <div class="app-window">
+        <!-- SETUP OVERLAY (first-run downloader) -->
+        <div id="setup-screen" class="setup-overlay">
+            <div class="setup-card">
+                <img class="setup-logo-img" src="${zamppLogo}" alt="ZAMPP">
+                <div class="setup-logo">ZAMPP</div>
+                <div class="setup-title">Setting up ZAMPP...</div>
+                <div class="setup-desc">Downloading server engine, please wait.</div>
+                <div class="setup-progress-wrap">
+                    <div id="setup-progress-bar" class="setup-progress-bar" style="width:0%"></div>
+                </div>
+                <div id="setup-percent" class="setup-percent">0%</div>
+            </div>
+        </div>
+
         <div class="header">
-            <h1>ZAMPP</h1>
-            <div class="subtitle">Zero-config Apache MySQL PHP Platform</div>
+            <img class="header-logo" src="${zamppLogo}" alt="ZAMPP">
+            <div class="header-text">
+                <h1>ZAMPP</h1>
+                <div class="subtitle">Zero-config Apache MySQL PHP Platform</div>
+            </div>
         </div>
 
         <!-- BARIS 1: WEB SERVER -->
@@ -92,6 +115,9 @@ const toastEl = document.getElementById('toast');
 let isWebRunning = false;
 let isMySQLRunning = false;
 let webEngine = 'nginx'; // engine locked at start time
+let needsPHPDownload = false; // selected PHP version not installed yet
+let isPHPDownloading = false; // per-version PHP download in progress
+let pendingPHPVersion = null; // version queued to auto-start after download
 
 function showToast(text, isError) {
     toastEl.textContent = text;
@@ -104,15 +130,78 @@ function setWebRunning(running) {
         webLight.classList.add('on');
         webBtn.innerText = 'Stop';
         webBtn.classList.add('stop-btn');
+        webBtn.classList.remove('download-btn');
         engineSelect.disabled = true;
         phpSelect.disabled = true;
     } else {
         webLight.classList.remove('on');
-        webBtn.innerText = 'Start';
-        webBtn.classList.remove('stop-btn');
+        // Restore button label based on whether selected PHP needs download.
+        if (needsPHPDownload) {
+            webBtn.innerText = '⬇️ Download PHP ' + phpSelect.value;
+            webBtn.classList.add('download-btn');
+            webBtn.classList.remove('stop-btn');
+        } else {
+            webBtn.innerText = 'Start';
+            webBtn.classList.remove('stop-btn');
+            webBtn.classList.remove('download-btn');
+        }
         engineSelect.disabled = false;
         phpSelect.disabled = false;
     }
+}
+
+// checkSelectedPHPVersion queries Go whether the selected PHP version is
+// installed and updates the main button state accordingly. PHP 7.4 ships
+// with the base engine, so it is always considered installed.
+function checkSelectedPHPVersion() {
+    if (isWebRunning) return; // do not flip the Stop button while running
+    const version = phpSelect.value;
+    if (version === '7.4') {
+        needsPHPDownload = false;
+        webBtn.innerText = 'Start';
+        webBtn.classList.remove('download-btn');
+        return;
+    }
+    CheckPHPVersion(version)
+        .then((installed) => {
+            if (isWebRunning) return; // state changed while awaiting
+            needsPHPDownload = !installed;
+            if (needsPHPDownload) {
+                webBtn.innerText = '⬇️ Download PHP ' + version;
+                webBtn.classList.add('download-btn');
+            } else {
+                webBtn.innerText = 'Start';
+                webBtn.classList.remove('download-btn');
+            }
+        })
+        .catch(() => {
+            // On error, fall back to Start label.
+            needsPHPDownload = false;
+            webBtn.innerText = 'Start';
+            webBtn.classList.remove('download-btn');
+        });
+}
+
+// showSetupOverlay(title, desc) displays the first-run-style overlay for
+// either the base engine download or a per-version PHP download.
+function showSetupOverlay(title, desc) {
+    if (!setupScreen) return;
+    const titleEl = setupScreen.querySelector('.setup-title');
+    const descEl = setupScreen.querySelector('.setup-desc');
+    if (titleEl) titleEl.textContent = title;
+    if (descEl) descEl.textContent = desc;
+    if (setupBar) setupBar.style.width = '0%';
+    if (setupPct) setupPct.textContent = '0%';
+    setupScreen.classList.remove('fade-out');
+    setupScreen.style.display = 'flex';
+}
+
+function hideSetupOverlay() {
+    if (!setupScreen) return;
+    setupScreen.classList.add('fade-out');
+    setTimeout(() => {
+        if (setupScreen) setupScreen.style.display = 'none';
+    }, 600);
 }
 
 function setMySQLRunning(running) {
@@ -129,12 +218,64 @@ function setMySQLRunning(running) {
 }
 
 // ===== Web Server toggle =====
+// The main button has 3 states: Start, Stop (running), or Download PHP.
+// toggleWeb inspects current state and routes to the correct action.
 function toggleWeb() {
     if (isWebRunning) {
         stopWeb();
-    } else {
-        startWeb();
+        return;
     }
+    if (isPHPDownloading) {
+        // A download is already in progress; ignore extra clicks.
+        return;
+    }
+    if (needsPHPDownload) {
+        downloadSelectedPHP();
+        return;
+    }
+    startWeb();
+}
+
+// downloadSelectedPHP triggers the per-version PHP downloader for the
+// currently selected version: shows the overlay, calls Go DownloadPHPVersion,
+// listens for php-download-progress / php-download-complete, then auto-starts
+// the web server once the version lands.
+function downloadSelectedPHP() {
+    const version = phpSelect.value;
+    if (!version || version === '7.4') return;
+    isPHPDownloading = true;
+    pendingPHPVersion = version;
+    webBtn.disabled = true;
+    phpSelect.disabled = true;
+    engineSelect.disabled = true;
+    showSetupOverlay('Downloading PHP ' + version + '...', 'Fetching PHP ' + version + ' module, please wait.');
+
+    DownloadPHPVersion(version).catch((err) => {
+        const msg = typeof err === 'string' ? err : String(err);
+        if (setupPct) setupPct.textContent = 'Error: ' + msg;
+        isPHPDownloading = false;
+        webBtn.disabled = false;
+        phpSelect.disabled = false;
+        engineSelect.disabled = false;
+    });
+}
+
+// onPHPDownloadComplete runs when 'php-download-complete' fires: hides the
+// overlay, restores controls, marks the version as installed, and (if the
+// user originally clicked the download button) auto-starts the web server.
+function onPHPDownloadComplete() {
+    hideSetupOverlay();
+    isPHPDownloading = false;
+    webBtn.disabled = false;
+    needsPHPDownload = false;
+    pendingPHPVersion = null;
+
+    // Re-evaluate button label (should now show Start for the freshly
+    // installed version, then auto-start the server).
+    checkSelectedPHPVersion();
+
+    // Auto-start the web server using the freshly downloaded version.
+    startWeb();
 }
 
 function startWeb() {
@@ -279,7 +420,61 @@ htdocsBtn.addEventListener('click', () => {
 // ===== Bindings =====
 webBtn.addEventListener('click', toggleWeb);
 mysqlBtn.addEventListener('click', toggleMySQL);
+phpSelect.addEventListener('change', checkSelectedPHPVersion);
 
 // ===== Initial render =====
 setWebRunning(false);
 setMySQLRunning(false);
+checkSelectedPHPVersion();
+
+// ===== First-run setup flow =====
+const setupScreen = document.getElementById('setup-screen');
+const setupBar = document.getElementById('setup-progress-bar');
+const setupPct = document.getElementById('setup-percent');
+
+// Listen for download progress events from the Go backend.
+EventsOn('download-progress', (pct) => {
+    const value = Math.max(0, Math.min(100, Number(pct) || 0));
+    if (setupBar) setupBar.style.width = value + '%';
+    if (setupPct) setupPct.textContent = value + '%';
+});
+
+// Listen for completion; fade out overlay then hide.
+EventsOn('download-complete', () => {
+    if (setupBar) setupBar.style.width = '100%';
+    if (setupPct) setupPct.textContent = '100%';
+    if (!setupScreen) return;
+    setupScreen.classList.add('fade-out');
+    setTimeout(() => {
+        if (setupScreen) setupScreen.style.display = 'none';
+    }, 600);
+});
+
+// Per-version PHP download progress.
+EventsOn('php-download-progress', (pct) => {
+    const value = Math.max(0, Math.min(100, Number(pct) || 0));
+    if (setupBar) setupBar.style.width = value + '%';
+    if (setupPct) setupPct.textContent = value + '%';
+});
+
+// Per-version PHP download complete: hide overlay, restore controls, auto-start.
+EventsOn('php-download-complete', onPHPDownloadComplete);
+
+// On load, check if binaries are already installed.
+CheckFirstRun()
+    .then((installed) => {
+        if (installed) {
+            // Already set up — hide overlay immediately.
+            if (setupScreen) setupScreen.style.display = 'none';
+            return;
+        }
+        // First run — keep overlay visible and start the download.
+        DownloadAndExtractBinaries().catch((err) => {
+            const msg = typeof err === 'string' ? err : String(err);
+            if (setupPct) setupPct.textContent = 'Error: ' + msg;
+        });
+    })
+    .catch((err) => {
+        const msg = typeof err === 'string' ? err : String(err);
+        if (setupPct) setupPct.textContent = 'Error: ' + msg;
+    });
