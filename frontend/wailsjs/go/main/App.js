@@ -42,6 +42,10 @@ export function OpenHtdocsFolder() {
   return window['go']['main']['App']['OpenHtdocsFolder']();
 }
 
+export function OpenTerminal(arg1) {
+  return window['go']['main']['App']['OpenTerminal'](arg1);
+}
+
 export function OpenWebRoot() {
   return window['go']['main']['App']['OpenWebRoot']();
 }

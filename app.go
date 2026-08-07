@@ -50,6 +50,31 @@ func (a *App) startup(ctx context.Context) {
 	if err := GenerateApacheConfig(); err != nil {
 		fmt.Println("startup: failed to generate httpd.conf:", err)
 	}
+	// Drop the default Welcome page into htdocs on first run.
+	if err := GenerateDefaultIndexPHP(); err != nil {
+		fmt.Println("startup: failed to generate default index.php:", err)
+	}
+}
+
+// shutdown is called when the app is closing (normal close, Cmd+Q, or
+// window close). It stops every engine ZAMPP started so that
+// http://127.0.0.1:8000, the PHP built-in server, and MySQL do not keep
+// running in the background after the app exits. Without this hook, a
+// force-quit leaves orphan daemons bound to our ports.
+func (a *App) shutdown(ctx context.Context) {
+	a.stopAllEngines()
+}
+
+// stopAllEngines stops every ZAMPP engine (nginx, apache, php, mysql) using
+// the multi-layer fallbacks already defined in StopNginx/etc. It is safe to
+// call from any goroutine and is used by both OnShutdown and the signal
+// handler in main() to cover force-quit / SIGTERM paths that bypass
+// Wails' shutdown hook.
+func (a *App) stopAllEngines() {
+	_ = a.StopNginx()
+	_ = a.StopApache()
+	_ = a.StopPHP()
+	_ = a.StopMySQL()
 }
 
 const appDirName = ".zampp"
@@ -965,12 +990,73 @@ func portListenerExists(port string) bool {
 	return strings.TrimSpace(string(out)) != ""
 }
 
+// adminerDownloadURL is the official Adminer single-file PHP release.
+const adminerDownloadURL = "https://github.com/vrana/adminer/releases/download/v4.8.1/adminer-4.8.1-en.php"
+
+// ensureAdminerDownloaded makes sure ~/.zampp/htdocs/adminer.php exists.
+// If it does not, it downloads the official Adminer PHP file from GitHub
+// Releases and writes it directly into the htdocs directory. This is an
+// on-demand download — it only runs the first time the user clicks the
+// Adminer button.
+func ensureAdminerDownloaded() error {
+	docRoot, err := htdocsPath()
+	if err != nil {
+		return fmt.Errorf("cannot resolve htdocs: %w", err)
+	}
+	if err := os.MkdirAll(docRoot, 0755); err != nil {
+		return fmt.Errorf("cannot create htdocs at %s: %w", docRoot, err)
+	}
+
+	target := filepath.Join(docRoot, "adminer.php")
+
+	// Already present — nothing to do.
+	if info, err := os.Stat(target); err == nil && !info.IsDir() && info.Size() > 0 {
+		return nil
+	}
+
+	// Download Adminer PHP file directly to the target path.
+	req, err := http.NewRequest(http.MethodGet, adminerDownloadURL, nil)
+	if err != nil {
+		return fmt.Errorf("cannot create request: %w", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to download Adminer: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("adminer download failed: HTTP %d", resp.StatusCode)
+	}
+
+	out, err := os.Create(target)
+	if err != nil {
+		return fmt.Errorf("cannot create %s: %w", target, err)
+	}
+	if _, err := io.Copy(out, resp.Body); err != nil {
+		out.Close()
+		_ = os.Remove(target)
+		return fmt.Errorf("cannot write %s: %w", target, err)
+	}
+	out.Close()
+	return nil
+}
+
 // OpenAdminer opens Adminer in the user's default browser via the macOS
 // `open` command. It routes the URL through whichever web server is currently
 // running (preferring Nginx :8000, falling back to Apache :8000), and prefills
 // the MySQL server field to 127.0.0.1:<mySQLPort> so login works against the
 // app's standalone MySQL on port 3307 (not XAMPP's 3306).
+//
+// On-Demand: if ~/.zampp/htdocs/adminer.php does not exist yet, it is
+// downloaded from the official Adminer GitHub release before opening.
 func (a *App) OpenAdminer() string {
+	// 1) Ensure Adminer is present in htdocs (download on-demand).
+	if err := ensureAdminerDownloaded(); err != nil {
+		return fmt.Sprintf("Error: %s", err.Error())
+	}
+
+	// 2) Resolve the running web server's base URL.
 	var baseURL string
 	if nginxProcess != nil && nginxProcess.Process != nil {
 		if err := nginxProcess.Process.Signal(os.Signal(nil)); err == nil {
@@ -995,8 +1081,8 @@ func (a *App) OpenAdminer() string {
 		return "Error: jalankan Nginx atau Apache terlebih dahulu"
 	}
 
-	// Adminer accepts ?server= and ?username= as GET params. We set the server
-	// to 127.0.0.1:3307 so the user only needs to type the password.
+	// 3) Build Adminer URL with prefilled MySQL server (127.0.0.1:3307) and
+	//    username=root so the user only needs the password.
 	url := baseURL + "/adminer.php?server=127.0.0.1:" + mySQLPort + "&username=root"
 
 	if err := exec.Command("open", url).Start(); err != nil {
@@ -1033,6 +1119,167 @@ func (a *App) OpenHtdocsFolder() error {
 	}
 	if err := exec.Command("open", docRoot).Run(); err != nil {
 		return fmt.Errorf("failed to open Finder: %w", err)
+	}
+	return nil
+}
+
+// composerPharURL is the official Composer stable phar download URL.
+const composerPharURL = "https://getcomposer.org/composer-stable.phar"
+
+// ensureComposerDownloaded makes sure ~/.zampp/bin/composer.phar exists. If it
+// does not, it downloads the official Composer stable phar and writes it
+// directly into ~/.zampp/bin/. This is an on-demand download — it only runs
+// the first time the user opens the ZAMPP Terminal.
+func ensureComposerDownloaded() error {
+	root, err := appRootDir()
+	if err != nil {
+		return fmt.Errorf("cannot resolve app root: %w", err)
+	}
+	binDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		return fmt.Errorf("cannot create bin dir %s: %w", binDir, err)
+	}
+
+	target := filepath.Join(binDir, "composer.phar")
+
+	// Already present — nothing to do.
+	if info, err := os.Stat(target); err == nil && !info.IsDir() && info.Size() > 0 {
+		_ = os.Chmod(target, 0755)
+		return nil
+	}
+
+	// Download Composer phar directly to the target path.
+	req, err := http.NewRequest(http.MethodGet, composerPharURL, nil)
+	if err != nil {
+		return fmt.Errorf("cannot create request: %w", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to download Composer: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("composer download failed: HTTP %d", resp.StatusCode)
+	}
+
+	out, err := os.Create(target)
+	if err != nil {
+		return fmt.Errorf("cannot create %s: %w", target, err)
+	}
+	if _, err := io.Copy(out, resp.Body); err != nil {
+		out.Close()
+		_ = os.Remove(target)
+		return fmt.Errorf("cannot write %s: %w", target, err)
+	}
+	out.Close()
+
+	// Make it executable (chmod +x) so it can be invoked directly if needed.
+	if err := os.Chmod(target, 0755); err != nil {
+		return fmt.Errorf("cannot chmod %s: %w", target, err)
+	}
+	return nil
+}
+
+// OpenTerminal opens a macOS terminal (iTerm2 if installed, otherwise the
+// built-in Terminal.app) pre-configured for ZAMPP. The activePhpVersion
+// (e.g. "8.2") is injected into the shell PATH so the user gets that exact
+// PHP binary, and a `composer` alias is created that runs the downloaded
+// composer.phar with that PHP. The terminal starts in ~/.zampp/htdocs.
+//
+// On-Demand: if ~/.zampp/bin/composer.phar does not exist yet, it is
+// downloaded from getcomposer.org before opening the terminal.
+//
+// The terminal session is scoped (no global PATH mutation) — only this shell
+// session sees the ZAMPP php/composer overrides.
+func (a *App) OpenTerminal(activePhpVersion string) error {
+	version := strings.TrimSpace(activePhpVersion)
+	if version == "" {
+		return fmt.Errorf("activePhpVersion is empty")
+	}
+
+	// 1) Ensure composer.phar is present (download on-demand).
+	if err := ensureComposerDownloaded(); err != nil {
+		return err
+	}
+
+	// 2) Detect the active PHP version's folder layout:
+	//    - static-php-cli (SPC): binary at ~/.zampp/bin/php/{version}/php
+	//      → add the version dir itself to PATH.
+	//    - MAMP layout:          binary at ~/.zampp/bin/php/{version}/bin/php
+	//      → add the /bin subdir to PATH.
+	//    This makes the exported PATH match whichever bundle was downloaded,
+	//    so `php` in the terminal resolves to the correct binary.
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("cannot resolve home dir: %w", err)
+	}
+	phpBase := filepath.Join(home, appDirName, "bin", "php", version)
+	phpExecutablePath := phpBase // default: static-php-cli layout
+	if _, err := os.Stat(filepath.Join(phpBase, "bin", "php")); err == nil {
+		// MAMP layout: php binary lives under /bin
+		phpExecutablePath = filepath.Join(phpBase, "bin")
+	}
+
+	// 3) Build the shell command string that will be executed in the
+	//    terminal session. It exports the detected php folder to the front
+	//    of PATH, aliases `composer` to use that PHP with the downloaded
+	//    composer.phar, cd's into htdocs, prints a banner, and runs
+	//    `php -v`.
+	//
+	//    Note: we escape the shell-side double-quotes as \", because the
+	//    string will be embedded inside an AppleScript string literal that
+	//    is itself wrapped in double-quotes — without escaping, the
+	//    embedded " would prematurely close the AppleScript string and
+	//    cause an osascript exit status 1.
+	cmdString := fmt.Sprintf(`export PATH=\"%s:$PATH\"; alias composer='php $HOME/.zampp/bin/composer.phar'; cd $HOME/.zampp/htdocs; clear; echo '⚡️ ZAMPP Smart Terminal Ready!'; echo 'Active PHP: %s'; echo 'Composer is ready to use. Type ''composer'' to test.'; echo ''; php -v`, phpExecutablePath, version)
+
+	// 4) Detect iTerm2 — if installed, prefer it over Terminal.app (most
+	//    developers use iTerm2). Falls back to the built-in Terminal
+	//    otherwise.
+	var script string
+	if _, err := os.Stat("/Applications/iTerm.app"); err == nil {
+		// iTerm2: if no window is open, create a new window; otherwise
+		// create a tab in the current window. This handles both the
+		// "iTerm not running" and "iTerm already open" cases reliably
+		// (the previous try/on error was fragile when iTerm was active).
+		script = fmt.Sprintf(`
+tell application "iTerm"
+    activate
+    if (count of windows) = 0 then
+        set newWindow to (create window with default profile)
+        tell current session of newWindow
+            write text "%s"
+        end tell
+    else
+        tell current window
+            create tab with default profile
+            tell current session
+                write text "%s"
+            end tell
+        end tell
+    end if
+end tell
+`, cmdString, cmdString)
+	} else {
+		// Fallback: built-in Terminal.app.
+		script = fmt.Sprintf(`
+tell application "Terminal"
+    activate
+    do script "%s"
+end tell
+`, cmdString)
+	}
+
+	// 5) Execute the AppleScript via osascript. The script is piped through
+	//    stdin with "-" as the script argument, which is more reliable than
+	//    passing a multi-line script via "-e <string>" — the latter can fail
+	//    with exit status 1 when the embedded shell command contains quotes
+	//    or newlines that confuse osascript's argv parser.
+	cmd := exec.Command("osascript", "-")
+	cmd.Stdin = strings.NewReader(script)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to open terminal: %w", err)
 	}
 	return nil
 }
@@ -1092,6 +1339,93 @@ func (a *App) StopWebServer(engine string) string {
 
 	return engResult + " | " + phpResult
 }
+
+// defaultIndexPHP is the Welcome Screen shown when the user opens the web
+// root for the first time. It reports the active PHP version and the running
+// web server (Nginx or Apache) and links back to semut.dev.
+const defaultIndexPHP = `<?php
+$php_version = phpversion();
+$raw_server = isset($_SERVER['SERVER_SOFTWARE']) ? strtolower($_SERVER['SERVER_SOFTWARE']) : 'unknown';
+
+$server_name = 'Unknown';
+$server_color = '#000000';
+
+if (strpos($raw_server, 'nginx') !== false) {
+    $server_name = 'Nginx';
+    $server_color = '#009639';
+} elseif (strpos($raw_server, 'apache') !== false) {
+    $server_name = 'Apache';
+    $server_color = '#D22128';
+} else {
+    $server_name = htmlspecialchars(explode(' ', $_SERVER['SERVER_SOFTWARE'])[0]);
+}
+
+$zampp_version = '1.0.0';
+?>
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Welcome to ZAMPP</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f4f4f5; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+        .container { background: white; padding: 40px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); text-align: center; max-width: 500px; width: 100%; }
+        .logo { width: 120px; height: 120px; margin-bottom: 20px; border-radius: 22px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+        h1 { color: #333; margin-bottom: 10px; font-size: 28px; font-weight: 700; }
+        p { color: #666; margin: 15px 0; font-size: 16px; display: flex; justify-content: space-between; align-items: center; padding: 0 20px; }
+        .info-box { background: #fafafa; border: 1px solid #eaeaea; border-radius: 8px; padding: 10px 0; margin-top: 25px; }
+        .badge { padding: 6px 12px; border-radius: 6px; font-weight: bold; color: white; font-size: 14px; }
+        .badge-php { background: #777BB4; }
+        .footer { margin-top: 30px; font-size: 13px; color: #999; line-height: 1.6; }
+        .footer a { color: #555; text-decoration: none; font-weight: 600; transition: color 0.2s; }
+        .footer a:hover { color: #000; text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <img src="https://raw.githubusercontent.com/semutdev/zampp/main/img/zampp-logo.png" alt="ZAMPP Logo" class="logo">
+        <h1>Welcome to ZAMPP</h1>
+        <div style="color: #666; font-size: 15px; margin-bottom: 10px;">Your local development environment is running perfectly.</div>
+
+        <div class="info-box">
+            <p><strong>PHP Version</strong> <span class="badge badge-php"><?php echo $php_version; ?></span></p>
+            <div style="height: 1px; background: #eaeaea; margin: 0 20px;"></div>
+            <p><strong>Active Server</strong> <span class="badge" style="background: <?php echo $server_color; ?>;"><?php echo $server_name; ?></span></p>
+        </div>
+
+        <div class="footer">
+            ZAMPP Version <?php echo $zampp_version; ?> &bull; macOS<br>
+            Built with &#10084;&#65039; by <a href="https://semut.dev" target="_blank">semut.dev</a>
+        </div>
+    </div>
+</body>
+</html>`
+
+// GenerateDefaultIndexPHP writes the Welcome page to ~/.zampp/htdocs/index.php
+// only if it does not already exist. This guarantees new users see a default
+// landing page the first time they open the web root, without overwriting an
+// existing index.php the user may have placed there.
+func GenerateDefaultIndexPHP() error {
+	docRoot, err := htdocsPath()
+	if err != nil {
+		return fmt.Errorf("cannot resolve htdocs: %w", err)
+	}
+	if err := os.MkdirAll(docRoot, 0755); err != nil {
+		return fmt.Errorf("cannot create htdocs at %s: %w", docRoot, err)
+	}
+
+	target := filepath.Join(docRoot, "index.php")
+
+	// Do not clobber an existing index.php.
+	if info, err := os.Stat(target); err == nil && !info.IsDir() && info.Size() > 0 {
+		return nil
+	}
+
+	if err := os.WriteFile(target, []byte(defaultIndexPHP), 0644); err != nil {
+		return fmt.Errorf("cannot write %s: %w", target, err)
+	}
+	return nil
+}
+
 // All paths are resolved to absolute form using the user's home directory.
 // It is called on startup and on every StartApache so the config always
 // reflects the current ports/paths.

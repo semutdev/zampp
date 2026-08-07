@@ -1,4 +1,4 @@
-module atta-dev-tools
+module zampp
 
 go 1.23
 

@@ -9,6 +9,7 @@ import {
     OpenAdminer,
     OpenHtdocsFolder,
     OpenWebRoot,
+    OpenTerminal,
     CheckFirstRun,
     DownloadAndExtractBinaries,
     CheckPHPVersion,
@@ -88,6 +89,7 @@ document.querySelector('#app').innerHTML = `
         <div class="toolbar">
             <button class="btn btn-tool" id="btn-webroot">WebRoot</button>
             <button class="btn btn-tool" id="btn-adminer">Adminer</button>
+            <button class="btn btn-tool" id="btn-terminal">💻 Terminal</button>
             <button class="btn btn-tool" id="btn-htdocs">📁 Open htdocs</button>
         </div>
 
@@ -108,6 +110,7 @@ const mysqlLight = document.getElementById('light-mysql');
 const webrootBtn = document.getElementById('btn-webroot');
 const adminerBtn = document.getElementById('btn-adminer');
 const htdocsBtn = document.getElementById('btn-htdocs');
+const terminalBtn = document.getElementById('btn-terminal');
 
 const toastEl = document.getElementById('toast');
 
@@ -411,6 +414,30 @@ adminerBtn.addEventListener('click', () => {
 htdocsBtn.addEventListener('click', () => {
     OpenHtdocsFolder()
         .then(() => showToast('Opened htdocs folder in Finder.', false))
+        .catch((err) => {
+            const msg = typeof err === 'string' ? err : String(err);
+            showToast(msg, true);
+        });
+});
+
+// ===== Terminal handler =====
+// Opens a macOS Terminal session with the ZAMPP PHP binary for the
+// currently selected PHP version first on PATH, plus a `composer` alias
+// pointing to the (auto-downloaded) composer.phar. Composer is fetched
+// on-demand by the Go backend on first open.
+terminalBtn.addEventListener('click', () => {
+    const version = phpSelect.value;
+    if (!version) {
+        showToast('Pilih versi PHP terlebih dahulu.', true);
+        return;
+    }
+    if (needsPHPDownload) {
+        showToast('PHP ' + version + ' belum terpasang. Klik tombol utama untuk download.', true);
+        return;
+    }
+    showToast('Membuka Terminal dengan PHP ' + version + '...', false);
+    OpenTerminal(version)
+        .then(() => showToast('Terminal siap dengan PHP ' + version + ' & Composer.', false))
         .catch((err) => {
             const msg = typeof err === 'string' ? err : String(err);
             showToast(msg, true);

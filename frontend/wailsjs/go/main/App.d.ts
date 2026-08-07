@@ -21,6 +21,8 @@ export function OpenAdminer():Promise<string>;
 
 export function OpenHtdocsFolder():Promise<void>;
 
+export function OpenTerminal(arg1:string):Promise<void>;
+
 export function OpenWebRoot():Promise<string>;
 
 export function StartApache():Promise<string>;
