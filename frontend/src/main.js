@@ -53,6 +53,7 @@ document.querySelector('#app').innerHTML = `
                             <option value="apache">Apache</option>
                         </select>
                         <select id="select-php">
+                            <option value="7.3">PHP 7.3</option>
                             <option value="7.4">PHP 7.4</option>
                             <option value="8.0">PHP 8.0</option>
                             <option value="8.1">PHP 8.1</option>
@@ -79,7 +80,7 @@ document.querySelector('#app').innerHTML = `
                             <option>MySQL 5.7</option>
                         </select>
                     </div>
-                    <div class="port-info">Port: 3307</div>
+                    <div class="port-info">Port: 3307 • User: root • Pass: root</div>
                 </div>
             </div>
             <button class="btn" id="btn-mysql">Start</button>
@@ -155,7 +156,8 @@ function setWebRunning(running) {
 
 // checkSelectedPHPVersion queries Go whether the selected PHP version is
 // installed and updates the main button state accordingly. PHP 7.4 ships
-// with the base engine, so it is always considered installed.
+// with the base engine, so it is always considered installed; every other
+// version (7.3, 8.0 - 8.5) is modular and checked on demand.
 function checkSelectedPHPVersion() {
     if (isWebRunning) return; // do not flip the Stop button while running
     const version = phpSelect.value;

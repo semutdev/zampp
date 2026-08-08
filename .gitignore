@@ -1,3 +1,12 @@
 build/bin
 node_modules
 frontend/dist
+
+# Wails build output (executables, .app bundles, installers)
+*.app
+*.dmg
+*.exe
+build/bin/
+
+# Compiled binary produced by `wails build` at repo root
+/zampp

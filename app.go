@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
@@ -1083,7 +1084,7 @@ func (a *App) OpenAdminer() string {
 
 	// 3) Build Adminer URL with prefilled MySQL server (127.0.0.1:3307) and
 	//    username=root so the user only needs the password.
-	url := baseURL + "/adminer.php?server=127.0.0.1:" + mySQLPort + "&username=root"
+	url := baseURL + "/adminer.php?server=127.0.0.1:" + mySQLPort + "&username=root&password=root"
 
 	if err := exec.Command("open", url).Start(); err != nil {
 		return fmt.Sprintf("Error: gagal membuka browser: %s", err.Error())
@@ -1680,7 +1681,161 @@ func (a *App) StartMySQL() string {
 	// Release the process so it keeps running in the background.
 	_ = cmd.Process.Release()
 
+	// Ensure the root account uses username=root / password=root so the
+	// frontend (and Adminer) can log in predictably. This runs the mysql
+	// client against the just-started server via the Unix socket, and is
+	// idempotent — it works on both fresh (no-password) and existing
+	// (password-already-set) data dirs.
+	go ensureMySQLRootCredentials(socketPath)
+
 	return fmt.Sprintf("Started MySQL on port %s (datadir: %s)", mySQLPort, dataDir)
+}
+
+// ensureMySQLRootCredentials guarantees the root MySQL account uses
+// password=root. It is run as a goroutine shortly after mysqld starts.
+//
+// Flow:
+//  1. Wait for the Unix socket to appear (mysqld ready).
+//  2. Try connecting with password=root. If it works, nothing to do.
+//  3. If that fails, try connecting with no password and run
+//     `ALTER USER 'root'@'localhost' IDENTIFIED BY 'root';` — this is the
+//     fresh-data-dir case.
+//  4. If that also fails (root already has a different password), spin up
+//     a temporary mysqld with --skip-grant-tables, set root's password to
+//     'root' via raw SQL on the `mysql` schema, stop it, and let the main
+//     mysqld continue. This guarantees the frontend contract holds even on
+//     a previously-used data dir whose root password was changed.
+func ensureMySQLRootCredentials(socketPath string) {
+	mysqlClient, err := mysqlClientPath()
+	if err != nil {
+		fmt.Println("mysql: cannot resolve mysql client path:", err)
+		return
+	}
+	if _, err := os.Stat(mysqlClient); err != nil {
+		fmt.Println("mysql: client binary not present, skipping root password set")
+		return
+	}
+
+	// 1) Wait briefly for the socket file to appear.
+	for i := 0; i < 50; i++ {
+		if _, err := os.Stat(socketPath); err == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// 2) Try password=root first — if it already works, nothing to do.
+	if tryMySQLCommand(mysqlClient, socketPath, "root", "root", "SELECT 1") {
+		fmt.Println("mysql: root password already 'root' — nothing to do")
+		return
+	}
+
+	// 3) Try no password (fresh data dir) -> set root password to 'root'.
+	if tryMySQLCommand(mysqlClient, socketPath, "", "", "ALTER USER 'root'@'localhost' IDENTIFIED BY 'root'; FLUSH PRIVILEGES;") {
+		fmt.Println("mysql: root password set to 'root' (was empty)")
+		return
+	}
+
+	// 4) Last resort: skip-grant-tables bootstrap.
+	fmt.Println("mysql: falling back to --skip-grant-tables to force root password")
+	if err := forceRootPasswordViaGrantTables(); err != nil {
+		fmt.Printf("mysql: could not force root password: %s\n", err.Error())
+		return
+	}
+	fmt.Println("mysql: root password forced to 'root' via skip-grant-tables")
+}
+
+// tryMySQLCommand runs the mysql client with the given credentials and a
+// SQL payload, returning true on success. Empty user means no -u flag and
+// empty password means no -p flag (so the client tries password-less login).
+// It returns true only if the command exited 0.
+func tryMySQLCommand(client, socket, user, pass, sql string) bool {
+	args := []string{"-S", socket}
+	if user != "" {
+		args = append(args, "-u", user)
+	}
+	if pass != "" {
+		args = append(args, "-p"+pass)
+	}
+	args = append(args, "-e", sql)
+	cmd := exec.Command(client, args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		fmt.Printf("mysql: attempt with user=%q pass_set=%v failed: %s: %s\n",
+			user, pass != "", err.Error(), strings.TrimSpace(string(out)))
+		return false
+	}
+	return true
+}
+
+// forceRootPasswordViaGrantTables starts a temporary mysqld with
+// --skip-grant-tables --skip-networking (so anyone can connect without a
+// password, but only via the Unix socket, no network exposure), runs SQL to
+// set root@localhost's password to 'root', then stops the temporary mysqld.
+// The main mysqld continues running unaffected because we use a one-off
+// temp socket file.
+func forceRootPasswordViaGrantTables() error {
+	binaryPath, err := mysqldPath()
+	if err != nil {
+		return err
+	}
+	dataDir, err := mysqlDataDir()
+	if err != nil {
+		return err
+	}
+	mysqlClient, err := mysqlClientPath()
+	if err != nil {
+		return err
+	}
+
+	// Use a separate socket so the temp mysqld does not conflict with the
+	// running main mysqld's socket.
+	tempSocket := filepath.Join(dataDir, "grant-reset.sock")
+	_ = os.Remove(tempSocket)
+
+	mysqld := exec.Command(binaryPath,
+		"--datadir="+dataDir,
+		"--socket="+tempSocket,
+		"--skip-grant-tables",
+		"--skip-networking",
+	)
+	if err := mysqld.Start(); err != nil {
+		return fmt.Errorf("cannot start temp mysqld: %w", err)
+	}
+	defer func() {
+		_ = mysqld.Process.Kill()
+		_ = os.Remove(tempSocket)
+	}()
+
+	// Wait for temp socket to appear.
+	for i := 0; i < 80; i++ {
+		if _, err := os.Stat(tempSocket); err == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if _, err := os.Stat(tempSocket); err != nil {
+		return fmt.Errorf("temp mysqld socket never appeared")
+	}
+
+	// skip-grant-tables means no password is needed AND ALTER USER works.
+	sql := "FLUSH PRIVILEGES; ALTER USER 'root'@'localhost' IDENTIFIED BY 'root'; FLUSH PRIVILEGES;"
+	cmd := exec.Command(mysqlClient, "-S", tempSocket, "-e", sql)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("could not set root password via grant tables: %s: %s", err.Error(), strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// mysqlClientPath returns the absolute path to the mysqladmin client binary
+// (e.g. ~/.zampp/bin/mysql/bin/mysqladmin).
+func mysqlClientPath() (string, error) {
+	base, err := mysqlBaseDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(base, "bin", "mysqladmin"), nil
 }
 
 // StopMySQL stops the running MySQL process, if any.
