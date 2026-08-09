@@ -49,8 +49,8 @@ document.querySelector('#app').innerHTML = `
                     <div class="service-name">Web Server</div>
                     <div class="controls">
                         <select id="select-engine">
-                            <option value="nginx">Nginx</option>
                             <option value="apache">Apache</option>
+                            <option value="nginx">Nginx</option>
                         </select>
                         <select id="select-php">
                             <option value="7.4">PHP 7.4</option>
@@ -116,7 +116,7 @@ const toastEl = document.getElementById('toast');
 // ===== State =====
 let isWebRunning = false;
 let isMySQLRunning = false;
-let webEngine = 'nginx'; // engine locked at start time
+let webEngine = 'apache'; // engine locked at start time
 let needsPHPDownload = false; // selected PHP version not installed yet
 let isPHPDownloading = false; // per-version PHP download in progress
 let pendingPHPVersion = null; // version queued to auto-start after download

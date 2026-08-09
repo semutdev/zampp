@@ -987,6 +987,60 @@ func (a *App) IsNginxInstalled() bool {
 	return isNginxInstalled()
 }
 
+// nginxTempDirs returns the list of temp directories nginx needs writable
+// access to at runtime: client_body, proxy, fastcgi, uwsgi, scgi temp paths
+// under ~/.zampp/tmp/nginx/.
+//
+// Without these, nginx falls back to its compile-time defaults — for the
+// ZAMPP binary those are baked-in as /Applications/MAMP/... paths which do
+// not exist on end-user machines, producing errors like
+//   mkdir() "/Applications/MAMP/Library/client_body_temp" failed (2: No such file or directory)
+// We override via `client_body_temp_path` etc in nginx.conf AND pre-create
+// them here so the first request doesn't 500 trying to mkdir on the fly.
+func nginxTempDirs() ([]string, error) {
+	root, err := appRootDir()
+	if err != nil {
+		return nil, err
+	}
+	base := filepath.Join(root, "tmp", "nginx")
+	subs := []string{
+		"client_body",
+		"proxy",
+		"fastcgi",
+		"uwsgi",
+		"scgi",
+	}
+	out := make([]string, 0, len(subs))
+	for _, s := range subs {
+		out = append(out, filepath.Join(base, s))
+	}
+	return out, nil
+}
+
+// ensureNginxTempDirs creates the nginx temp directories and the nginx log
+// directory before nginx is started. All paths are absolute under ~/.zampp/
+// so they are writable regardless of where the nginx binary was compiled to
+// expect logs and temp files.
+func ensureNginxTempDirs() error {
+	logDir, err := nginxLogDir()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		return fmt.Errorf("cannot create nginx log dir %s: %w", logDir, err)
+	}
+	dirs, err := nginxTempDirs()
+	if err != nil {
+		return err
+	}
+	for _, d := range dirs {
+		if err := os.MkdirAll(d, 0755); err != nil {
+			return fmt.Errorf("cannot create nginx temp dir %s: %w", d, err)
+		}
+	}
+	return nil
+}
+
 // GenerateNginxConfig writes a fresh nginx.conf into ~/.zampp/conf/nginx/.
 // It is called on startup and on every StartNginx, so config always reflects
 // the current port/docroot settings. The conf dir is created if missing.
@@ -1014,19 +1068,60 @@ func GenerateNginxConfig() error {
 	if err := os.MkdirAll(logDir, 0755); err != nil {
 		return fmt.Errorf("cannot create nginx log dir: %w", err)
 	}
+	// Pre-create the temp directories (client_body, proxy, fastcgi, uwsgi,
+	// scgi) so nginx never falls back to its compile-time MAMP defaults.
+	if err := ensureNginxTempDirs(); err != nil {
+		return fmt.Errorf("cannot prepare nginx temp dirs: %w", err)
+	}
 
 	accessLog := filepath.Join(logDir, "access.log")
 	errorLog := filepath.Join(logDir, "error.log")
 	pidFile := filepath.Join(logDir, "nginx.pid")
 
-	// Template uses tabs indentation; written via raw string. Paths are inserted
-	// as-is (they are already absolute and shell-safe inside nginx.conf).
+	// Compute absolute temp paths under ~/.zampp/tmp/nginx/ so they fully
+	// override the MAMP-baked defaults baked into the binary
+	// (/Applications/MAMP/Library/client_body_temp etc.).
+	tmpDirs, err := nginxTempDirs()
+	if err != nil {
+		return err
+	}
+	clientBodyTmp := tmpDirs[0]
+	proxyTmp := tmpDirs[1]
+	fastcgiTmp := tmpDirs[2]
+	uwsgiTmp := tmpDirs[3]
+	scgiTmp := tmpDirs[4]
+
+	// nginx.conf generator.
+	//
+	// Critical: PHP backend on port 8001 is a FastCGI server (php-cgi -b or
+	// php-fpm) — NOT an HTTP server. The previous config used
+	//     proxy_pass http://127.0.0.1:8001;
+	// which sends an HTTP request to the FastCGI port. PHP immediately closes
+	// the connection (it only speaks the FastCGI binary protocol), nginx logs
+	//
+	//     kevent() ... Connection reset by peer while reading response header
+	//     from upstream, upstream: "http://127.0.0.1:8001/index.php"
+	//
+	// and returns 502 Bad Gateway. The correct directive is `fastcgi_pass`,
+	// which speaks the FastCGI protocol.
+	//
+	// All paths (pid, error_log, access_log, *_temp_path) are absolute under
+	// ~/.zampp/ to override the compile-time MAMP defaults that point at
+	// /Applications/MAMP/... which doesn't exist on end-user machines.
 	conf := "worker_processes  1;\n" +
-		"pid " + pidFile + ";\n\n" +
+		"pid " + pidFile + ";\n" +
+		"error_log " + errorLog + ";\n\n" +
 		"events {\n" +
 		"    worker_connections  1024;\n" +
 		"}\n\n" +
 		"http {\n" +
+		// Override compile-time temp paths so nginx never tries to mkdir
+		// under /Applications/MAMP/Library/... (which fails with ENOENT).
+		"    client_body_temp_path " + clientBodyTmp + ";\n" +
+		"    proxy_temp_path       " + proxyTmp + ";\n" +
+		"    fastcgi_temp_path     " + fastcgiTmp + ";\n" +
+		"    uwsgi_temp_path       " + uwsgiTmp + ";\n" +
+		"    scgi_temp_path        " + scgiTmp + ";\n\n" +
 		"    access_log  " + accessLog + ";\n" +
 		"    error_log   " + errorLog + ";\n\n" +
 		"    server {\n" +
@@ -1037,8 +1132,14 @@ func GenerateNginxConfig() error {
 		"        location / {\n" +
 		"            try_files $uri $uri/ =404;\n" +
 		"        }\n\n" +
+		// Hand off .php to the FastCGI worker on 8001. SCRIPT_FILENAME is
+		// constructed from $document_root + $fastcgi_script_name and is the
+		// absolute path PHP needs (resolves 'No input file specified.').
 		"        location ~ \\.php$ {\n" +
-		"            proxy_pass http://127.0.0.1:" + phpInternalPort + ";\n" +
+		"            fastcgi_pass   127.0.0.1:" + phpInternalPort + ";\n" +
+		"            fastcgi_index  index.php;\n" +
+		"            fastcgi_param  SCRIPT_FILENAME  $document_root$fastcgi_script_name;\n" +
+		"            include        fastcgi_params;\n" +
 		"        }\n" +
 		"    }\n" +
 		"}\n"
@@ -1050,8 +1151,51 @@ func GenerateNginxConfig() error {
 	if err := os.WriteFile(confPath, []byte(conf), 0644); err != nil {
 		return fmt.Errorf("cannot write nginx.conf: %w", err)
 	}
+
+	// Write a minimal fastcgi_params file next to nginx.conf. The official
+	// nginx build ships this under conf/fastcgi_params, but the ZAMPP nginx
+	// binary distribution only contains the `nginx` executable (no conf/
+	// directory). Without this file, `include fastcgi_params;` would
+	// fail with `open() .../fastcgi_params failed (2: No such file or
+	// directory)` and nginx -t would report config test is failed.
+	fcgiParamsPath := filepath.Join(filepath.Dir(confPath), "fastcgi_params")
+	if err := os.WriteFile(fcgiParamsPath, []byte(fastcgiParamsContent), 0644); err != nil {
+		return fmt.Errorf("cannot write fastcgi_params: %w", err)
+	}
+
 	return nil
 }
+
+// fastcgiParamsContent is the standard set of FastCGI variables nginx passes
+// to PHP. Mirrors the upstream conf/fastcgi_params file shipped with nginx.
+// SCRIPT_FILENAME is intentionally NOT included here — it is set explicitly
+// in the location ~ \.php$ block in the generated nginx.conf so we have full
+// control over its form ($document_root + $fastcgi_script_name, the canonical
+// mapping for php-cgi/php-fpm).
+const fastcgiParamsContent = `fastcgi_param  QUERY_STRING       $query_string;
+fastcgi_param  REQUEST_METHOD     $request_method;
+fastcgi_param  CONTENT_TYPE       $content_type;
+fastcgi_param  CONTENT_LENGTH     $content_length;
+
+fastcgi_param  SCRIPT_NAME        $fastcgi_script_name;
+fastcgi_param  REQUEST_URI        $request_uri;
+fastcgi_param  DOCUMENT_URI       $document_uri;
+fastcgi_param  DOCUMENT_ROOT      $document_root;
+fastcgi_param  SERVER_PROTOCOL    $server_protocol;
+fastcgi_param  REQUEST_SCHEME     $scheme;
+fastcgi_param  HTTPS              $https if_not_empty;
+
+fastcgi_param  GATEWAY_INTERFACE  CGI/1.1;
+fastcgi_param  SERVER_SOFTWARE    nginx/$nginx_version;
+
+fastcgi_param  REMOTE_ADDR        $remote_addr;
+fastcgi_param  REMOTE_PORT        $remote_port;
+fastcgi_param  SERVER_ADDR        $server_addr;
+fastcgi_param  SERVER_PORT        $server_port;
+fastcgi_param  SERVER_NAME        $server_name;
+
+fastcgi_param  REDIRECT_STATUS    200;
+`
 
 // StartNginx starts the standalone nginx server using the generated conf.
 func (a *App) StartNginx() string {
@@ -1090,15 +1234,49 @@ func (a *App) StartNginx() string {
 	// Defensive cleanup of any stale nginx on our port.
 	a.stopNginxOnPort()
 
-	cmd := exec.Command(binaryPath, "-c", confPath)
+	// Use `-p <prefix>` to override the compile-time prefix baked into the
+	// nginx binary (for ZAMPP that's /Applications/MAMP/Library/... which
+	// doesn't exist on end-user machines and causes errors like
+	//   open() "/Applications/MAMP/logs/nginx_error.log" failed
+	//   mkdir() "/Applications/MAMP/Library/client_body_temp" failed
+	// `-p ~/.zampp/` makes nginx resolve every relative path (include
+	// fastcgi_params, etc.) against the ZAMPP prefix instead. Combined with
+	// the absolute paths in *_temp_path/error_log/pid directives above, this
+	// supports the MAMP-baked defaults so the binary is portable.
+	appRoot, err := appRootDir()
+	if err != nil {
+		return err.Error()
+	}
+	// Pass error_log via `-g` so it takes effect as early as possible. nginx
+	// 1.19.2 still emits a single pre-config "alert" line to its compile-
+	// time default error_log path (/Applications/MAMP/...) before reading
+	// the `-g` directives, but crucially the /Applications/MAMP directory
+	// is NOT created when the `-g` error_log is in place — nginx fails to
+	// open the default path, logs one alert, then switches to our `-g`
+	// path. Without `-g`, /Applications/MAMP/ gets created by nginx trying
+	// to mkdir-and-open the default path on every start.
+	//
+	// `pid` is intentionally NOT in `-g` — it would duplicate the pid
+	// directive already in nginx.conf, which nginx treats as an emerg-level
+	// "duplicate directive" error.
+	logDir, _ := nginxLogDir()
+	globalDirectives := fmt.Sprintf(
+		"error_log %s;",
+		filepath.Join(logDir, "error.log"),
+	)
+	cmd := exec.Command(binaryPath,
+		"-p", appRoot+"/",
+		"-c", confPath,
+		"-g", globalDirectives,
+	)
 
 	// Stream stdout/stderr to log file + parent terminal so nginx startup
 	// errors (missing module, bad config) are visible in `wails dev` and in
 	// ~/.zampp/logs/nginx/stdout.log. extraStderr captures them for the
 	// synchronous error message below.
-	nginxLogDir, _ := nginxLogDir()
+	usedLogDir, _ := nginxLogDir()
 	stderrBuffer := newSafeBuffer()
-	attachLogger(cmd, nginxLogDir, "stdout.log", stderrBuffer)
+	attachLogger(cmd, usedLogDir, "stdout.log", stderrBuffer)
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Sprintf("Error: failed to start nginx: %s", err.Error())
