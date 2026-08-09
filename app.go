@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -10,8 +11,10 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	goruntime "runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
@@ -29,11 +32,12 @@ func NewApp() *App {
 
 // homeDir returns the user's absolute home directory path.
 func homeDir() (string, error) {
-	u, err := user.Current()
-	if err != nil {
-		return "", err
-	}
-	return u.HomeDir, nil
+	// Use os.UserHomeDir() instead of user.Current().HomeDir so the path is
+	// resolved via $HOME (prefers the same value the user sees in a shell),
+	// and so we don't pull in os/user's cgo path on platforms where it can
+	// be avoided. Apache does not understand `~`, so the absolute path
+	// returned here is what gets written into httpd.conf.
+	return os.UserHomeDir()
 }
 
 // startup is called when the app starts. The context is saved
@@ -94,7 +98,7 @@ const apachePort = "8000"
 
 // phpInternalPort is the internal PHP built-in server port that Nginx/Apache
 // proxy PHP requests to. The UI does not need to know about this port.
-const phpInternalPort = "8081"
+const phpInternalPort = "8001"
 
 // mysqlProcess holds a reference to the running mysqld process (if any).
 // It is managed via StartMySQL / StopMySQL.
@@ -111,6 +115,64 @@ var apacheProcess *exec.Cmd
 // phpProcess holds a reference to the running PHP built-in server process
 // (if any). It is managed via StartPHP / StopPHP.
 var phpProcess *exec.Cmd
+
+// safeBuffer is a goroutine-safe bytes.Buffer used to capture the first chunk
+// of a child process's stderr so we can report it synchronously after a
+// startup-timeout, while also teeing it to the parent stderr.
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func newSafeBuffer() *safeBuffer { return &safeBuffer{} }
+
+func (s *safeBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+func (s *safeBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
+
+// attachLogger wires a child process's stdout/stderr to a per-engine log
+// file under ~/.zampp/logs/{engine}/, echoes them to the parent terminal so
+// errors are visible in `wails dev`, and optionally tees stderr into an
+// extra writer (e.g. a safeBuffer) so the caller can read the first chunk of
+// startup errors synchronously after a port-listen timeout.
+//
+// IMPORTANT: callers MUST NOT also assign cmd.Stderr or call cmd.StderrPipe()
+// after this — that double-wires stderr and causes a nil-pointer panic at
+// cmd.Start() time, because StderrPipe() returns nil when Stderr != nil.
+//
+// Returns the log file handle; it must remain open for the lifetime of the
+// child process, otherwise the child loses its stderr/stdout target.
+func attachLogger(cmd *exec.Cmd, engineLogDir string, filename string, extraStderr io.Writer) (*os.File, error) {
+	if err := os.MkdirAll(engineLogDir, 0755); err != nil {
+		return nil, fmt.Errorf("cannot create log dir %s: %w", engineLogDir, err)
+	}
+	logPath := filepath.Join(engineLogDir, filename)
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND|os.O_TRUNC, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("cannot open log %s: %w", logPath, err)
+	}
+
+	stderrWriters := []io.Writer{f, os.Stderr}
+	if extraStderr != nil {
+		stderrWriters = append(stderrWriters, extraStderr)
+	}
+
+	// Go's exec package spawns its own internal goroutine to pump the child's
+	// stdout/stderr into these writers. We never need to call StderrPipe()
+	// ourselves (and must not — StderrPipe returns nil if Stderr != nil,
+	// which then panics io.Copy).
+	cmd.Stdout = io.MultiWriter(f, os.Stdout)
+	cmd.Stderr = io.MultiWriter(stderrWriters...)
+	return f, nil
+}
 
 // appRootDir returns the absolute path to the app's root directory
 // inside the user's home directory (e.g. /Users/jamal/.zampp).
@@ -281,18 +343,37 @@ func (a *App) CheckPHPVersion(version string) bool {
 // PHP bundle. The archive is expected to contain a top-level folder named
 // {version} so that extraction into ~/.zampp/bin/php/ yields
 // ~/.zampp/bin/php/{version}.
+//
+// The zip filename is platform-specific:
+//   - darwin  -> php-{version}-mac.zip
+//   - windows -> php-{version}-win.zip
+//
+// This allows shipping separate builds per OS while keeping the extracted
+// folder layout ({version}/) identical across archives.
 func phpVersionZipURL(version string) string {
-	return fmt.Sprintf("https://github.com/semutdev/zampp/releases/download/v1.0.0/php-%s.zip", version)
+	var osSuffix string
+	switch goruntime.GOOS {
+	case "darwin":
+		osSuffix = "mac"
+	case "windows":
+		osSuffix = "win"
+	default:
+		// Unknown platform — fall back to the mac suffix so the URL is still
+		// well-formed rather than producing "php-8.2-.zip".
+		osSuffix = "mac"
+	}
+	return fmt.Sprintf("https://github.com/semutdev/zampp/releases/download/v1.0.0/php-%s-%s.zip", version, osSuffix)
 }
 
 // DownloadPHPVersion downloads and extracts the per-version PHP bundle for the
 // given version (e.g. "8.2").
 //
 // Flow:
-//  1. Download https://github.com/semutdev/zampp/releases/download/v1.0.0/php-{version}.zip
-//     to /tmp/php-{version}.zip, emitting 'php-download-progress' (0-100).
+//  1. Download https://github.com/semutdev/zampp/releases/download/v1.0.0/php-{version}-{mac|win}.zip
+//     to /tmp/php-{version}-{mac|win}.zip, emitting 'php-download-progress' (0-100).
+//     The OS suffix is selected at runtime via goruntime.GOOS.
 //  2. Extract into ~/.zampp/bin/php/ (zip already contains a top-level {version} folder).
-//  3. Delete /tmp/php-{version}.zip.
+//  3. Delete /tmp/php-{version}-{mac|win}.zip.
 //  4. Emit 'php-download-complete'.
 //
 // The base engine (DownloadAndExtractBinaries) is independent and remains
@@ -313,7 +394,18 @@ func (a *App) DownloadPHPVersion(version string) error {
 		return fmt.Errorf("cannot create php base dir %s: %w", base, err)
 	}
 
-	tmpZip := fmt.Sprintf("/tmp/php-%s.zip", version)
+	// Derive the platform-suffixed filename from the URL pattern so the
+	// temp zip filename stays consistent with the remote asset name.
+	var osSuffix string
+	switch goruntime.GOOS {
+	case "darwin":
+		osSuffix = "mac"
+	case "windows":
+		osSuffix = "win"
+	default:
+		osSuffix = "mac"
+	}
+	tmpZip := fmt.Sprintf("/tmp/php-%s-%s.zip", version, osSuffix)
 	url := phpVersionZipURL(version)
 
 	// 1) Download with progress streaming.
@@ -523,18 +615,159 @@ func isPHPInstalled(version string) bool {
 	return err == nil
 }
 
-// StartPHP starts the PHP built-in web server for the given version.
-// version is the folder name under ~/.zampp/bin/php (e.g. "8.2").
-// The server listens on localhost:8081 (internal) and serves from
-// ~/.zampp/htdocs. Nginx (on :8000) proxies .php requests here.
+// phpVariantForVersion decides which PHP SAPI binary to launch for a given
+// version and how to address it (FastCGI bind target).
+//
+//   - 7.4   → php-cgi -b 127.0.0.1:8001          (CGI, ships with base engine)
+//   - 8.x+  → php-fpm --fpm-config <dynamic.conf> (FPM, modular downloads)
+//
+// php-fpm cannot bind to a port via a CLI flag — it must be configured through
+// an FPM pool config file. writePHPFPMConfig generates a minimal config at
+// ~/.zampp/config/php-fpm-{version}.conf with `listen = 127.0.0.1:8001`.
+//
+// Returns the resolved absolute binary path and the arg slice to pass to exec.
+func phpLaunchCommand(version string) (binaryPath string, args []string, err error) {
+	base, err := phpBaseDir()
+	if err != nil {
+		return "", nil, err
+	}
+
+	// Candidates: php-cgi / php-fpm may sit next to php (SPC layout) or
+	// inside a bin/ subfolder (MAMP layout).
+	lookup := func(name string) (string, bool) {
+		for _, p := range []string{
+			filepath.Join(base, version, name),
+			filepath.Join(base, version, "bin", name),
+		} {
+			if info, statErr := os.Stat(p); statErr == nil && !info.IsDir() {
+				return p, true
+			}
+		}
+		return "", false
+	}
+
+	isCGI := version == "7.4"
+
+	var sapiName string
+	if isCGI {
+		sapiName = "php-cgi"
+	} else {
+		sapiName = "php-fpm"
+	}
+
+	bp, ok := lookup(sapiName)
+	if !ok {
+		// Construct a precise, actionable error. Start with "Error:" so
+		// StartWebServer can detect this via HasPrefix and roll back the
+		// Apache/Nginx start — without that, the frontend would still
+		// proceed to start the web server and the user would see a vague
+		// "Service Unavailable" 503 from Apache (which can't reach the
+		// never-started PHP FastCGI worker on 8001) instead of the real
+		// cause: the PHP SAPI binary is missing from the released zip.
+		//
+		// We detect two scenarios:
+		//   1) Version dir exists but only ships `php` (CLI), no SAPI.
+		//      This is a packaging issue in the released PHP zip.
+		//   2) Version dir doesn't exist at all — version not installed.
+		verDir := filepath.Join(base, version)
+		cliOnly := false
+		if info, statErr := os.Stat(verDir); statErr == nil && info.IsDir() {
+			// Version folder exists. Does it have any `php` binary (CLI)?
+			for _, candidate := range []string{
+				filepath.Join(verDir, "php"),
+				filepath.Join(verDir, "bin", "php"),
+			} {
+				if pi, e := os.Stat(candidate); e == nil && !pi.IsDir() {
+					cliOnly = true
+					break
+				}
+			}
+		}
+		if cliOnly {
+			return "", nil, fmt.Errorf(
+				"Error: PHP %s hanya berisi binary CLI (php), tanpa %s. "+
+					"Bundel zip untuk PHP %s tidak menyertakan SAPI FastCGI — "+
+					"re-pack zip-nya agar menyertakan php-fpm (untuk versi 8.x) "+
+					"atau php-cgi (untuk 7.4). Lihat: ~/.zampp/bin/php/%s/",
+				version, sapiName, version, version,
+			)
+		}
+		return "", nil, fmt.Errorf(
+			"Error: %s untuk PHP %s belum terpasang di ~/.zampp/bin/php/%s/ "+
+				"(diperiksa: ./%s dan ./bin/%s). Pastikan versi PHP tersebut sudah di-download.",
+			sapiName, version, version, sapiName, sapiName,
+		)
+	}
+
+	if isCGI {
+		// php-cgi supports the FastCGI bind flag directly.
+		return bp, []string{"-b", "127.0.0.1:" + phpInternalPort}, nil
+	}
+
+	// php-fpm: generate/update the pool config, then pass --fpm-config.
+	cfgPath, err := writePHPFPMConfig(version)
+	if err != nil {
+		return "", nil, fmt.Errorf("cannot write php-fpm config: %w", err)
+	}
+	// -F keeps FPM in the foreground so the spawned process keeps running.
+	// Without -F, php-fpm daemonizes and the master exits immediately,
+	// leaving cmd.Start() with a defunct process.
+	return bp, []string{"-F", "--fpm-config", cfgPath}, nil
+}
+
+// writePHPFPMConfig renders the minimal FPM pool config for a PHP version
+// into ~/.zampp/config/php-fpm-{version}.conf and returns its absolute path.
+//
+// listen = 127.0.0.1:8001 — the internal FastCGI port Nginx/Apache proxies to.
+// pm = dynamic with conservative child counts suitable for local dev.
+//
+// The directory ~/.zampp/config is created on demand (ensureAppDirs also
+// creates it during startup; this is a per-call safety net).
+func writePHPFPMConfig(version string) (string, error) {
+	root, err := appRootDir()
+	if err != nil {
+		return "", err
+	}
+	cfgDir := filepath.Join(root, "config")
+	if err := os.MkdirAll(cfgDir, 0755); err != nil {
+		return "", fmt.Errorf("cannot create config dir %s: %w", cfgDir, err)
+	}
+
+	cfgPath := filepath.Join(cfgDir, fmt.Sprintf("php-fpm-%s.conf", version))
+	content := fmt.Sprintf(`[global]
+pid = /tmp/zampp-php-fpm.pid
+error_log = /tmp/zampp-php-fpm.log
+
+[www]
+listen = 127.0.0.1:%s
+pm = dynamic
+pm.max_children = 5
+pm.start_servers = 2
+pm.min_spare_servers = 1
+pm.max_spare_servers = 3
+`, phpInternalPort)
+
+	if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {
+		return "", fmt.Errorf("cannot write php-fpm config %s: %w", cfgPath, err)
+	}
+	return cfgPath, nil
+}
+
+// StartPHP launches the PHP FastCGI worker on 127.0.0.1:8001 for the given
+// version. The worker is spawned in the background (non-blocking) using
+// cmd.Start(); Nginx/Apache on :8000 then proxies .php requests here.
+//
+// Version-specific SAPI:
+//   - 7.4   → php-cgi -b 127.0.0.1:8001
+//   - 8.x+  → php-fpm -F --fpm-config ~/.zampp/config/php-fpm-{version}.conf
+//             (config carries `listen = 127.0.0.1:8001`)
 func (a *App) StartPHP(version string) string {
 	if version == "" {
 		return "Error: PHP version is empty"
 	}
 
-	binaryPath, err := getPHPExecutablePath(version)
+	binaryPath, args, err := phpLaunchCommand(version)
 	if err != nil {
-		// err already carries the "belum terpasang" message.
 		return err.Error()
 	}
 
@@ -554,8 +787,15 @@ func (a *App) StartPHP(version string) string {
 	// Stop any existing PHP server on the internal port before starting a new one.
 	a.StopPHP()
 
-	cmd := exec.Command(binaryPath, "-S", "127.0.0.1:"+phpInternalPort, "-t", docRoot)
-	// Detach from stdout/stderr so the process keeps running after the call returns.
+	cmd := exec.Command(binaryPath, args...)
+
+	// Stream stdout/stderr to log file + parent terminal so PHP startup
+	// errors are not lost. The extraStderr writer captures the first chunk
+	// of errors for synchronous reporting after a port-timeout below.
+	phpLogDir, _ := phpLogDir()
+	stderrBuffer := newSafeBuffer()
+	attachLogger(cmd, phpLogDir, fmt.Sprintf("php-%s.log", version), stderrBuffer)
+
 	if err := cmd.Start(); err != nil {
 		return fmt.Sprintf("Error: failed to start PHP %s: %s", version, err.Error())
 	}
@@ -565,10 +805,26 @@ func (a *App) StartPHP(version string) string {
 	// Release the process so it keeps running in the background.
 	_ = cmd.Process.Release()
 
-	return fmt.Sprintf("Started PHP %s on http://127.0.0.1:%s (docroot: %s)", version, phpInternalPort, docRoot)
+	// Verify the PHP worker actually bound the FastCGI port. php-fpm can fail
+	// on startup (bad config, missing module, port in use) even though
+	// cmd.Start() returned nil.
+	if !waitForPort(phpInternalPort, 2000*time.Millisecond) {
+		stderrText := strings.TrimSpace(stderrBuffer.String())
+		a.StopPHP()
+		if stderrText != "" {
+			return fmt.Sprintf("Error: PHP %s gagal start (port %s tidak listening): %s", version, phpInternalPort, stderrText)
+		}
+		return fmt.Sprintf("Error: PHP %s gagal start (port %s tidak listening dalam 2s). Periksa ~/.zampp/logs/php/php-%s.log", version, phpInternalPort, version)
+	}
+
+	sapi := "php-fpm"
+	if version == "7.4" {
+		sapi = "php-cgi"
+	}
+	return fmt.Sprintf("Started PHP %s (%s) on 127.0.0.1:%s (docroot: %s)", version, sapi, phpInternalPort, docRoot)
 }
 
-// StopPHP stops the PHP process currently listening on the internal port (8081).
+// StopPHP stops the PHP process currently listening on the internal port (8001).
 func (a *App) StopPHP() string {
 	// Primary path: kill the tracked PHP process if we still hold a reference
 	// to it. Never target a process group (no -PID, no PID 0 or negative).
@@ -703,6 +959,16 @@ func nginxLogDir() (string, error) {
 	return filepath.Join(root, "logs", "nginx"), nil
 }
 
+// phpLogDir returns the absolute path to the PHP per-version logs directory
+// (e.g. ~/.zampp/logs/php). Each PHP version gets its own log file inside.
+func phpLogDir() (string, error) {
+	root, err := appRootDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, "logs", "php"), nil
+}
+
 // isNginxInstalled reports whether the nginx binary exists.
 func isNginxInstalled() bool {
 	p, err := nginxBinaryPath()
@@ -825,12 +1091,33 @@ func (a *App) StartNginx() string {
 	a.stopNginxOnPort()
 
 	cmd := exec.Command(binaryPath, "-c", confPath)
+
+	// Stream stdout/stderr to log file + parent terminal so nginx startup
+	// errors (missing module, bad config) are visible in `wails dev` and in
+	// ~/.zampp/logs/nginx/stdout.log. extraStderr captures them for the
+	// synchronous error message below.
+	nginxLogDir, _ := nginxLogDir()
+	stderrBuffer := newSafeBuffer()
+	attachLogger(cmd, nginxLogDir, "stdout.log", stderrBuffer)
+
 	if err := cmd.Start(); err != nil {
 		return fmt.Sprintf("Error: failed to start nginx: %s", err.Error())
 	}
 
 	nginxProcess = cmd
 	_ = cmd.Process.Release()
+
+	// Verify nginx really bound the port; if it crashed on startup (bad
+	// config, missing module, port in use) report it instead of pretending
+	// the server is up.
+	if !waitForPort(nginxPort, 1500*time.Millisecond) {
+		stderrText := strings.TrimSpace(stderrBuffer.String())
+		a.StopNginx()
+		if stderrText != "" {
+			return fmt.Sprintf("Error: Nginx gagal start (port %s tidak listening): %s", nginxPort, stderrText)
+		}
+		return fmt.Sprintf("Error: Nginx gagal start (port %s tidak listening dalam 1.5s). Periksa ~/.zampp/logs/nginx/stdout.log", nginxPort)
+	}
 
 	return fmt.Sprintf("Started Nginx on port %s (conf: %s)", nginxPort, confPath)
 }
@@ -989,6 +1276,25 @@ func portListenerExists(port string) bool {
 		return false
 	}
 	return strings.TrimSpace(string(out)) != ""
+}
+
+// waitForPort polls lsof for a TCP listener on the given port up to the
+// specified timeout. Returns true once the port is listening, false if the
+// deadline elapses first. The poll interval is 100ms.
+//
+// This is used by StartApache/StartNginx to detect startup failures where
+// exec() succeeds (cmd.Start() returns nil) but the process crashes within
+// milliseconds (e.g. dynamic loader errors, missing modules, port in use).
+// Without this check, the frontend would believe the server is up.
+func waitForPort(port string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if portListenerExists(port) {
+			return true
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return false
 }
 
 // adminerDownloadURL is the official Adminer single-file PHP release.
@@ -1285,7 +1591,7 @@ end tell
 	return nil
 }
 
-// StartWebServer starts the PHP built-in server (internal port 8081) and then
+// StartWebServer starts the PHP built-in server (internal port 8001) and then
 // the chosen web server engine (nginx or apache) on port 8000. The UI calls
 // this single API so it only needs one Start button + an engine dropdown.
 //
@@ -1465,6 +1771,7 @@ func GenerateApacheConfig() error {
 	serverRoot := filepath.Join(appRoot, "bin", "apache")
 
 	var b strings.Builder
+	// --- Global directives (must be OUTSIDE <VirtualHost>) ---
 	b.WriteString("ServerRoot \"" + serverRoot + "\"\n")
 	b.WriteString("Listen " + apachePort + "\n\n")
 	b.WriteString("LoadModule unixd_module modules/mod_unixd.so\n")
@@ -1473,18 +1780,57 @@ func GenerateApacheConfig() error {
 	b.WriteString("LoadModule mime_module modules/mod_mime.so\n")
 	b.WriteString("LoadModule rewrite_module modules/mod_rewrite.so\n")
 	b.WriteString("LoadModule proxy_module modules/mod_proxy.so\n")
-	b.WriteString("LoadModule proxy_http_module modules/mod_proxy_http.so\n\n")
+	b.WriteString("LoadModule proxy_fcgi_module modules/mod_proxy_fcgi.so\n\n")
 	b.WriteString("ServerName localhost\n")
-	b.WriteString("PidFile \"" + pidFile + "\"\n\n")
-	b.WriteString("DocumentRoot \"" + docRoot + "\"\n")
-	b.WriteString("<Directory \"" + docRoot + "\">\n")
-	b.WriteString("    Options Indexes FollowSymLinks\n")
-	b.WriteString("    AllowOverride All\n")
-	b.WriteString("    Require all granted\n")
-	b.WriteString("</Directory>\n\n")
-	b.WriteString("DirectoryIndex index.php index.html\n")
-	b.WriteString("TypesConfig conf/mime.types\n\n")
-	b.WriteString("ProxyPassMatch ^/(.*\\.php(/.*)?)$ http://127.0.0.1:" + phpInternalPort + "/$1\n")
+	b.WriteString("PidFile \"" + pidFile + "\"\n")
+	b.WriteString("ErrorLog \"" + filepath.Join(logDir, "error.log") + "\"\n")
+	b.WriteString("LogLevel warn\n")
+	b.WriteString("ProxyTimeout 60\n\n")
+	// AbsoluteHtdocsPath: Apache does not understand `~`, so we feed it the
+	// fully-resolved absolute path returned by os.UserHomeDir() (already
+	// absolute, e.g. /Users/jamal/.zampp/htdocs). The same value is reused
+	// for DocumentRoot, the Directory block, and the fcgi:// URL prefix.
+	absoluteHtdocsPath := docRoot
+
+	// --- VirtualHost: contains all per-site rules per the requested template ---
+	b.WriteString("<VirtualHost *:" + apachePort + ">\n")
+	b.WriteString("    DocumentRoot \"" + absoluteHtdocsPath + "\"\n\n")
+	// Route .php requests to the FastCGI worker (php-cgi/php-fpm) on 8001.
+	//
+	// Why SetHandler + ProxyFCGISetEnvIf and not ProxyPassMatch:
+	//
+	// 1) The classic pattern that works reliably for php-cgi (which is more
+	//    picky than php-fpm about SCRIPT_FILENAME) on Apache 2.4.10+ is:
+	//
+	//       <FilesMatch \.php$>
+	//           SetHandler "proxy:fcgi://127.0.0.1:8001"
+	//       </FilesMatch>
+	//       ProxyFCGISetEnvIf "true" SCRIPT_FILENAME "%{reqenv:DOCUMENT_ROOT}%{reqenv:SCRIPT_NAME}"
+	//
+	//    mod_proxy_fcgi doesn't always derive SCRIPT_FILENAME the way
+	//    php-cgi expects (it sets SCRIPT_NAME / PATH_INFO but leaves
+	//    SCRIPT_FILENAME pointing at the URL rather than the mapped
+	//    filesystem path). The explicit ProxyFCGISetEnvIf rewrites it to
+	//    DOCUMENT_ROOT + SCRIPT_NAME — the canonical, valid value.
+	//
+	// 2) We previously tried ProxyPassMatch "fcgi://host:port{absRoot}/$1"
+	//    and a trailing-slash-less SetHandler. Both still produced
+	//    'No input file specified.' on Apache 2.4.54 + php-cgi.
+	//
+	// 3) The bare fcgi SetHandler sets the handler so Apache knows to proxy
+	//    to FastCGI; ProxyFCGISetEnvIf adjusts the env passed via FastCGI.
+	b.WriteString("    ProxyFCGISetEnvIf \"true\" SCRIPT_FILENAME \"%{reqenv:DOCUMENT_ROOT}%{reqenv:SCRIPT_NAME}\"\n")
+	b.WriteString("    <FilesMatch \\.php$>\n")
+	b.WriteString("        SetHandler \"proxy:fcgi://127.0.0.1:" + phpInternalPort + "\"\n")
+	b.WriteString("    </FilesMatch>\n\n")
+	b.WriteString("    <Directory \"" + absoluteHtdocsPath + "\">\n")
+	b.WriteString("        Options Indexes FollowSymLinks\n")
+	b.WriteString("        AllowOverride All\n")
+	b.WriteString("        Require all granted\n")
+	b.WriteString("    </Directory>\n\n")
+	b.WriteString("    DirectoryIndex index.php index.html\n")
+	b.WriteString("</VirtualHost>\n\n")
+	b.WriteString("TypesConfig conf/mime.types\n")
 
 	confPath, err := apacheConfPath()
 	if err != nil {
@@ -1534,12 +1880,36 @@ func (a *App) StartApache() string {
 	a.stopApacheOnPort()
 
 	cmd := exec.Command(binaryPath, "-f", confPath)
+
+	// Stream stdout/stderr to log file + parent terminal so httpd startup
+	// errors (dyld "Library not loaded", missing modules, bind failures)
+	// are visible in `wails dev` and in ~/.zampp/logs/apache/stdout.log.
+	// extraStderr captures the first chunk of startup errors so we can
+	// report them synchronously after a port-timeout below.
+	apacheLogDir, _ := apacheLogDir()
+	stderrBuffer := newSafeBuffer()
+	attachLogger(cmd, apacheLogDir, "stdout.log", stderrBuffer)
+
 	if err := cmd.Start(); err != nil {
 		return fmt.Sprintf("Error: failed to start apache: %s", err.Error())
-  }
+	}
 
 	apacheProcess = cmd
 	_ = cmd.Process.Release()
+
+	// Wait briefly for the port to come up. httpd usually listens within a few
+	// hundred ms; if the process crashed on startup (loader errors, port in
+	// use, module load failure), the port check will stay false and we report
+	// the stderr we captured instead of a misleading "Started Apache".
+	if !waitForPort(apachePort, 1500*time.Millisecond) {
+		stderrText := strings.TrimSpace(stderrBuffer.String())
+		// Best-effort cleanup of any half-spawned process.
+		a.StopApache()
+		if stderrText != "" {
+			return fmt.Sprintf("Error: Apache gagal start (port %s tidak listening): %s", apachePort, stderrText)
+		}
+		return fmt.Sprintf("Error: Apache gagal start (port %s tidak listening dalam 1.5s). Periksa ~/.zampp/logs/apache/stdout.log", apachePort)
+	}
 
 	return fmt.Sprintf("Started Apache on port %s (conf: %s)", apachePort, confPath)
 }

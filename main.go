@@ -19,7 +19,7 @@ func main() {
 	app := NewApp()
 
 	// Catch SIGINT/SIGTERM (kill, Ctrl-C) and stop all engines so that
-	// nginx/httpd/mysqld/php do not leak as orphans bound to 8000/3307/8081.
+	// nginx/httpd/mysqld/php do not leak as orphans bound to 8000/3307/8001.
 	// Wails' OnShutdown handles normal close, but force-quit / SIGTERM can
 	// bypass it — this signal handler covers that gap.
 	sigCh := make(chan os.Signal, 1)

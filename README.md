@@ -64,7 +64,7 @@ All your website project files (HTML/PHP/WordPress) should be placed inside the 
 |----------------|------|--------------------------------------------|
 | Web Server     | 8000 | Nginx or Apache (user-selectable)         |
 | MySQL          | 3307 | Avoids clashing with XAMPP's 3306         |
-| PHP (internal) | 8081 | Proxied through the chosen web server      |
+| PHP (internal) | 8001 | Proxied through the chosen web server      |
 
 Zero manual configuration — config is regenerated on each start.
 
