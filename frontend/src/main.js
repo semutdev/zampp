@@ -116,6 +116,14 @@ const terminalBtn = document.getElementById('btn-terminal');
 
 const toastEl = document.getElementById('toast');
 
+// Setup-view and main-view refs declared early (before showSetupOverlay
+// is defined) so that function body closures resolve them without TDZ
+// issues even if called synchronously.
+const setupView = document.getElementById('setup-view');
+const mainView = document.getElementById('main-view');
+const setupBar = document.getElementById('setup-progress-bar');
+const setupPct = document.getElementById('setup-percent');
+
 // ===== State =====
 let isWebRunning = false;
 let isMySQLRunning = false;
@@ -455,10 +463,7 @@ setMySQLRunning(false);
 checkSelectedPHPVersion();
 
 // ===== First-run setup flow =====
-const setupView = document.getElementById('setup-view');
-const mainView = document.getElementById('main-view');
-const setupBar = document.getElementById('setup-progress-bar');
-const setupPct = document.getElementById('setup-percent');
+// (view element refs are declared near the top, before showSetupOverlay.)
 
 // Listen for download progress events from the Go backend.
 EventsOn('download-progress', (pct) => {
