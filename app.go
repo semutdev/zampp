@@ -203,20 +203,48 @@ func phpBaseDir() (string, error) {
 	return filepath.Join(root, "bin", "php"), nil
 }
 
-// CheckFirstRun reports whether the ZAMPP binaries have already been set up
-// in ~/.zampp/bin/php. Returns true if installed, false if first run / not
-// yet downloaded. The frontend uses this to decide whether to show the
-// setup/download overlay.
+// CheckFirstRun reports whether the ZAMPP base engine bundle has been fully
+// set up in ~/.zampp. Returns true only when every required BASE binary
+// exists as a regular file:
+//
+//   - bin/apache/httpd
+//   - bin/nginx/nginx
+//   - bin/mysql/bin/mysqld
+//
+// PHP 7.4 is intentionally NOT checked here — it is part of the base
+// engine bundle but, like every other PHP version, also has its own
+// per-version Download button in the UI (driven by CheckPHPVersion).
+// This separation means a missing 7.4 alone does not trigger a full
+// re-download of the ~300 MB engine bundle; the user can just click the
+// per-version Download button for 7.4 instead.
+//
+// The frontend uses this to decide whether to show the first-run
+// setup/download overlay. Checking only the directory existence was too
+// lax — a stale or partially-populated ~/.zampp would pass and the app
+// would skip the engine download, leaving the user with no working
+// servers.
 func (a *App) CheckFirstRun() bool {
-	phpDir, err := phpBaseDir()
+	root, err := appRootDir()
 	if err != nil {
 		return false
 	}
-	info, err := os.Stat(phpDir)
-	if err != nil {
-		return false
+	// Required base binaries for the engine to be considered "installed".
+	// Mirrors the package-engine.sh validation set (excluding php/7.4).
+	required := []string{
+		filepath.Join(root, "bin", "apache", "httpd"),
+		filepath.Join(root, "bin", "nginx", "nginx"),
+		filepath.Join(root, "bin", "mysql", "bin", "mysqld"),
 	}
-	return info.IsDir()
+	for _, p := range required {
+		info, err := os.Stat(p)
+		if err != nil {
+			return false
+		}
+		if info.IsDir() {
+			return false
+		}
+	}
+	return true
 }
 
 // binariesZipURL is the GitHub release URL for the ZAMPP engine bundle
@@ -320,23 +348,18 @@ func (a *App) downloadWithProgress(url, destPath, eventName string) (int64, erro
 	return total, nil
 }
 
-// CheckPHPVersion reports whether the given PHP version has been installed
-// under ~/.zampp/bin/php/{version}. Returns true if the directory exists,
-// false otherwise. The frontend uses this to decide whether the selected
-// version needs to be downloaded before starting the web server.
+// CheckPHPVersion reports whether the given PHP version has been fully
+// installed under ~/.zampp/bin/php/{version} with an executable `php`
+// binary present. Returns true if installed, false otherwise. The frontend
+// uses this to decide whether the selected version needs to be downloaded
+// before starting the web server — including PHP 7.4, which is part of the
+// base engine bundle but may still be missing on a fresh / stale install.
 func (a *App) CheckPHPVersion(version string) bool {
 	if version == "" {
 		return false
 	}
-	base, err := phpBaseDir()
-	if err != nil {
-		return false
-	}
-	info, err := os.Stat(filepath.Join(base, version))
-	if err != nil {
-		return false
-	}
-	return info.IsDir()
+	_, err := getPHPExecutablePath(version)
+	return err == nil
 }
 
 // phpVersionZipURL builds the GitHub Releases download URL for a per-version

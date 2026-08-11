@@ -153,18 +153,14 @@ function setWebRunning(running) {
 }
 
 // checkSelectedPHPVersion queries Go whether the selected PHP version is
-// installed and updates the main button state accordingly. PHP 7.4 ships
-// with the base engine, so it is always considered installed; every other
-// version (8.1 - 8.5) is modular and checked on demand.
+// installed and updates the main button state accordingly. ALL versions
+// (including 7.4) are checked on demand — 7.4 ships with the base engine
+// bundle but may still be missing on a fresh or partially-installed
+// ~/.zampp, in which case the Download button is shown just like 8.x.
 function checkSelectedPHPVersion() {
     if (isWebRunning) return; // do not flip the Stop button while running
     const version = phpSelect.value;
-    if (version === '7.4') {
-        needsPHPDownload = false;
-        webBtn.innerText = 'Start';
-        webBtn.classList.remove('download-btn');
-        return;
-    }
+    if (!version) return;
     CheckPHPVersion(version)
         .then((installed) => {
             if (isWebRunning) return; // state changed while awaiting
