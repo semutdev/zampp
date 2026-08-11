@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
@@ -824,20 +825,20 @@ func (a *App) StartPHP(version string) string {
 	}
 
 	phpProcess = cmd
-
-	// Release the process so it keeps running in the background.
-	_ = cmd.Process.Release()
+	// Do NOT call Process.Release() — php-cgi (-b) and php-fpm (-F) both run
+	// in foreground mode and stay alive as our child. We want a live handle
+	// for StopPHP (Signal/Kill) + cmd.Wait() (reap zombie).
 
 	// Verify the PHP worker actually bound the FastCGI port. php-fpm can fail
 	// on startup (bad config, missing module, port in use) even though
 	// cmd.Start() returned nil.
-	if !waitForPort(phpInternalPort, 2000*time.Millisecond) {
+	if !waitForPort(phpInternalPort, 3000*time.Millisecond) {
 		stderrText := strings.TrimSpace(stderrBuffer.String())
 		a.StopPHP()
 		if stderrText != "" {
 			return fmt.Sprintf("Error: PHP %s gagal start (port %s tidak listening): %s", version, phpInternalPort, stderrText)
 		}
-		return fmt.Sprintf("Error: PHP %s gagal start (port %s tidak listening dalam 2s). Periksa ~/.zampp/logs/php/php-%s.log", version, phpInternalPort, version)
+		return fmt.Sprintf("Error: PHP %s gagal start (port %s tidak listening dalam 3s). Periksa ~/.zampp/logs/php/php-%s.log", version, phpInternalPort, version)
 	}
 
 	sapi := "php-fpm"
@@ -848,16 +849,28 @@ func (a *App) StartPHP(version string) string {
 }
 
 // StopPHP stops the PHP process currently listening on the internal port (8001).
-func (a *App) StopPHP() string {
+func (a *App) StopPHP() (result string) {
+	defer func() {
+		if r := recover(); r != nil {
+			result = fmt.Sprintf("Error: StopPHP panic: %v", r)
+		}
+	}()
+
 	// Primary path: kill the tracked PHP process if we still hold a reference
 	// to it. Never target a process group (no -PID, no PID 0 or negative).
 	if phpProcess != nil && phpProcess.Process != nil {
 		pid := phpProcess.Process.Pid
 		if pid > 0 {
-			if err := phpProcess.Process.Kill(); err != nil {
-				// Per-PID fallback (NOT a process-group kill).
-				_ = exec.Command("kill", "-TERM", fmt.Sprintf("%d", pid)).Run()
+			// SIGTERM first so php-fpm/php-cgi can clean up.
+			if err := phpProcess.Process.Signal(syscall.SIGTERM); err != nil {
+				_ = phpProcess.Process.Kill()
 			}
+			// Reap zombie in background.
+			go func(c *exec.Cmd) {
+				if c != nil {
+					_ = c.Wait()
+				}
+			}(phpProcess)
 			phpProcess = nil
 			return fmt.Sprintf("stopped PHP (PID %d)", pid)
 		}
@@ -1284,7 +1297,7 @@ func (a *App) StartNginx() string {
 	// "duplicate directive" error.
 	logDir, _ := nginxLogDir()
 	globalDirectives := fmt.Sprintf(
-		"error_log %s;",
+		"error_log %s; daemon off;",
 		filepath.Join(logDir, "error.log"),
 	)
 	cmd := exec.Command(binaryPath,
@@ -1306,18 +1319,20 @@ func (a *App) StartNginx() string {
 	}
 
 	nginxProcess = cmd
-	_ = cmd.Process.Release()
+	// Do NOT call Process.Release() — with `daemon off;` (set in -g) the
+	// nginx master stays alive as our child and we want a live handle for
+	// StopNginx (Signal/Kill) + cmd.Wait() (reap zombie).
 
 	// Verify nginx really bound the port; if it crashed on startup (bad
 	// config, missing module, port in use) report it instead of pretending
 	// the server is up.
-	if !waitForPort(nginxPort, 1500*time.Millisecond) {
+	if !waitForPort(nginxPort, 3000*time.Millisecond) {
 		stderrText := strings.TrimSpace(stderrBuffer.String())
 		a.StopNginx()
 		if stderrText != "" {
 			return fmt.Sprintf("Error: Nginx gagal start (port %s tidak listening): %s", nginxPort, stderrText)
 		}
-		return fmt.Sprintf("Error: Nginx gagal start (port %s tidak listening dalam 1.5s). Periksa ~/.zampp/logs/nginx/stdout.log", nginxPort)
+		return fmt.Sprintf("Error: Nginx gagal start (port %s tidak listening dalam 3s). Periksa ~/.zampp/logs/nginx/stdout.log", nginxPort)
 	}
 
 	return fmt.Sprintf("Started Nginx on port %s (conf: %s)", nginxPort, confPath)
@@ -1331,18 +1346,30 @@ func (a *App) StartNginx() string {
 //   - Fallback A: `nginx -s stop -c <conf>` (nginx's own graceful stop).
 //   - Fallback B: `pkill -f nginx` (matches the nginx command line, no PID).
 //   - Fallback C: per-PID `kill -TERM <pid>` for listeners on nginxPort.
-func (a *App) StopNginx() string {
+func (a *App) StopNginx() (result string) {
+	defer func() {
+		if r := recover(); r != nil {
+			result = fmt.Sprintf("Error: StopNginx panic: %v", r)
+		}
+	}()
+
 	var messages []string
 
 	// Primary path: kill the tracked process only.
 	if nginxProcess != nil && nginxProcess.Process != nil {
 		pid := nginxProcess.Process.Pid
 		if pid > 0 {
-			if err := nginxProcess.Process.Kill(); err != nil {
-				messages = append(messages, fmt.Sprintf("Kill() failed for PID %d: %s", pid, err.Error()))
-			} else {
-				messages = append(messages, fmt.Sprintf("stopped Nginx (PID %d)", pid))
+			// SIGTERM for graceful shutdown (nginx handles it cleanly).
+			if err := nginxProcess.Process.Signal(syscall.SIGTERM); err != nil {
+				_ = nginxProcess.Process.Kill()
 			}
+			// Reap zombie in background.
+			go func(c *exec.Cmd) {
+				if c != nil {
+					_ = c.Wait()
+				}
+			}(nginxProcess)
+			messages = append(messages, fmt.Sprintf("stopped Nginx (PID %d)", pid))
 		}
 		nginxProcess = nil
 	}
@@ -1354,11 +1381,9 @@ func (a *App) StopNginx() string {
 		}
 	}
 
-	// Fallback B: kill any process whose command line matches "nginx". This is
-	// process-name based, not PID based, so it never targets a process group.
-	_ = exec.Command("pkill", "-f", "nginx").Run()
-
-	// Fallback C: as a last resort, kill the exact PID listening on nginxPort.
+	// Fallback B: kill the exact PID listening on nginxPort (defensive).
+	// We do NOT run `pkill -f nginx` — that would kill every nginx on the
+	// system (Homebrew, MAMP, etc).
 	msgs := a.stopNginxOnPort()
 	if msgs != "" && !strings.HasPrefix(msgs, "Info:") {
 		messages = append(messages, msgs)
@@ -2080,7 +2105,7 @@ func (a *App) StartApache() string {
 	// Defensive cleanup of any stale httpd on our port.
 	a.stopApacheOnPort()
 
-	cmd := exec.Command(binaryPath, "-f", confPath)
+	cmd := exec.Command(binaryPath, "-DFOREGROUND", "-f", confPath)
 
 	// Stream stdout/stderr to log file + parent terminal so httpd startup
 	// errors (dyld "Library not loaded", missing modules, bind failures)
@@ -2096,20 +2121,22 @@ func (a *App) StartApache() string {
 	}
 
 	apacheProcess = cmd
-	_ = cmd.Process.Release()
+	// Do NOT call Process.Release() — with -DFOREGROUND the httpd parent
+	// stays alive as our child and we want a live handle for StopApache
+	// (Signal/Kill) + cmd.Wait() (reap zombie).
 
 	// Wait briefly for the port to come up. httpd usually listens within a few
 	// hundred ms; if the process crashed on startup (loader errors, port in
 	// use, module load failure), the port check will stay false and we report
 	// the stderr we captured instead of a misleading "Started Apache".
-	if !waitForPort(apachePort, 1500*time.Millisecond) {
+	if !waitForPort(apachePort, 3000*time.Millisecond) {
 		stderrText := strings.TrimSpace(stderrBuffer.String())
 		// Best-effort cleanup of any half-spawned process.
 		a.StopApache()
 		if stderrText != "" {
 			return fmt.Sprintf("Error: Apache gagal start (port %s tidak listening): %s", apachePort, stderrText)
 		}
-		return fmt.Sprintf("Error: Apache gagal start (port %s tidak listening dalam 1.5s). Periksa ~/.zampp/logs/apache/stdout.log", apachePort)
+		return fmt.Sprintf("Error: Apache gagal start (port %s tidak listening dalam 3s). Periksa ~/.zampp/logs/apache/stdout.log", apachePort)
 	}
 
 	return fmt.Sprintf("Started Apache on port %s (conf: %s)", apachePort, confPath)
@@ -2119,22 +2146,41 @@ func (a *App) StartApache() string {
 //
 // Safety contract:
 //   - Never targets a process group (no `kill -- -PID`, no PID 0/negative).
+//   - Never runs `pkill -f httpd` — that would kill ALL httpd on the system,
+//     including other applications' Apache (XAMPP, Homebrew, MAMP).
 //   - Primary path: kill the tracked *exec.Cmd's process only.
 //   - Fallback A: `httpd -k stop -f <conf>` (Apache's own graceful stop).
-//   - Fallback B: `pkill -f httpd` (matches the httpd command line, no PID).
-//   - Fallback C: per-PID `kill -TERM <pid>` for listeners on apachePort.
-func (a *App) StopApache() string {
+//   - Fallback B: per-PID `kill -TERM <pid>` for listeners on apachePort.
+//
+// With -DFOREGROUND (used in StartApache), the httpd parent stays alive as a
+// child of this Go process until killed here. We call cmd.Wait() in a
+// goroutine after SIGTERM to reap the zombie.
+func (a *App) StopApache() (result string) {
+	defer func() {
+		if r := recover(); r != nil {
+			result = fmt.Sprintf("Error: StopApache panic: %v", r)
+		}
+	}()
+
 	var messages []string
 
 	// Primary path: kill the tracked process only.
 	if apacheProcess != nil && apacheProcess.Process != nil {
 		pid := apacheProcess.Process.Pid
 		if pid > 0 {
-			if err := apacheProcess.Process.Kill(); err != nil {
-				messages = append(messages, fmt.Sprintf("Kill() failed for PID %d: %s", pid, err.Error()))
-			} else {
-				messages = append(messages, fmt.Sprintf("stopped Apache (PID %d)", pid))
+			// Try graceful SIGTERM first. With -DFOREGROUND, httpd parent
+			// handles SIGTERM and propagates to workers.
+			if err := apacheProcess.Process.Signal(syscall.SIGTERM); err != nil {
+				// Fall back to SIGKILL if SIGTERM fails (process already dead).
+				_ = apacheProcess.Process.Kill()
 			}
+			// Reap zombie in background; do not block the UI.
+			go func(c *exec.Cmd) {
+				if c != nil {
+					_ = c.Wait()
+				}
+			}(apacheProcess)
+			messages = append(messages, fmt.Sprintf("stopped Apache (PID %d)", pid))
 		}
 		apacheProcess = nil
 	}
@@ -2146,11 +2192,7 @@ func (a *App) StopApache() string {
 		}
 	}
 
-	// Fallback B: kill any process whose command line matches "httpd". This is
-	// process-name based, not PID based, so it never targets a process group.
-	_ = exec.Command("pkill", "-f", "httpd").Run()
-
-	// Fallback C: as a last resort, kill the exact PID listening on apachePort.
+	// Fallback B: kill the exact PID listening on apachePort (defensive).
 	msgs := a.stopApacheOnPort()
 	if msgs != "" && !strings.HasPrefix(msgs, "Info:") {
 		messages = append(messages, msgs)
@@ -2416,14 +2458,20 @@ func mysqlClientPath() (string, error) {
 //   - Primary path: kill the tracked *exec.Cmd's process only.
 //   - Fallback A: per-PID `kill -TERM <pid>` for the tracked process.
 //   - Fallback B: per-PID `kill -TERM <pid>` for listeners on mySQLPort.
-func (a *App) StopMySQL() string {
+func (a *App) StopMySQL() (result string) {
+	defer func() {
+		if r := recover(); r != nil {
+			result = fmt.Sprintf("Error: StopMySQL panic: %v", r)
+		}
+	}()
+
 	var messages []string
 
 	// Primary path: kill the tracked process only.
 	if mysqlProcess != nil && mysqlProcess.Process != nil {
 		pid := mysqlProcess.Process.Pid
 		if pid > 0 {
-			if err := mysqlProcess.Process.Kill(); err != nil {
+			if err := mysqlProcess.Process.Signal(syscall.SIGTERM); err != nil {
 				// Per-PID fallback (NOT a process-group kill).
 				if err2 := exec.Command("kill", "-TERM", fmt.Sprintf("%d", pid)).Run(); err2 != nil {
 					messages = append(messages, fmt.Sprintf("failed to stop MySQL (PID %d): %s", pid, err.Error()))
@@ -2433,6 +2481,12 @@ func (a *App) StopMySQL() string {
 			} else {
 				messages = append(messages, fmt.Sprintf("stopped MySQL (PID %d)", pid))
 			}
+			// Reap zombie in background.
+			go func(c *exec.Cmd) {
+				if c != nil {
+					_ = c.Wait()
+				}
+			}(mysqlProcess)
 		}
 		mysqlProcess = nil
 	}
