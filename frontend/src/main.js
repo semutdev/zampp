@@ -494,6 +494,11 @@ EventsOn('download-complete', () => {
     setTimeout(() => {
         if (mainView) mainView.style.display = 'block';
         if (setupView) setupView.style.display = 'none';
+        // Re-check whether the selected PHP version (default 7.4) is now
+        // installed after the engine download. Without this, needsPHPDownload
+        // stays true from the pre-download check and the button keeps showing
+        // "Download PHP 7.4" even though it was just installed.
+        checkSelectedPHPVersion();
     }, 400);
 });
 

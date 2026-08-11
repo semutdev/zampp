@@ -805,6 +805,31 @@ pm.max_spare_servers = 3
 	return cfgPath, nil
 }
 
+// probeBinaryRuns executes the PHP SAPI binary briefly (with the same args
+// StartPHP would use) to catch immediate-failure errors that don't reach the
+// listening stage — most notably "dyld: Library not loaded" on macOS when the
+// bundled PHP was packaged without required shared libs. We run the binary
+// with a 1200ms timeout. A nil error means it ran long enough that we
+// couldn't gather diagnostic info either way; non-nil means we captured a
+// startup error.
+//
+// We use a separate exec.Cmd (not the one StartPHP already started) so the
+// original process state is not perturbed.
+func probeBinaryRuns(binaryPath string, args []string) error {
+	// For php-cgi, ask for -v (version) — that exercises dyld and core
+	// library loading without binding any port. For php-fpm, -v also works.
+	probe := exec.Command(binaryPath, "-v")
+	out, err := probe.CombinedOutput()
+	if err != nil {
+		text := strings.TrimSpace(string(out))
+		if text == "" {
+			return fmt.Errorf("%s (no output)", err.Error())
+		}
+		return fmt.Errorf("%s: %s", err.Error(), text)
+	}
+	return nil
+}
+
 // StartPHP launches the PHP FastCGI worker on 127.0.0.1:8001 for the given
 // version. The worker is spawned in the background (non-blocking) using
 // cmd.Start(); Nginx/Apache on :8000 then proxies .php requests here.
@@ -838,21 +863,44 @@ func (a *App) StartPHP(version string) string {
 
 	// Stop any existing PHP server on the internal port before starting a new one.
 	a.StopPHP()
+	// Wait briefly for the port to actually free up after StopPHP — php-cgi
+	// and php-fpm can take a few hundred ms to release the listening socket
+	// after SIGTERM. If we Start() immediately, the new process can fail to
+	// bind with "Address already in use" and the port never comes up.
+	for i := 0; i < 30; i++ {
+		if !portListenerExists(phpInternalPort) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 
 	cmd := exec.Command(binaryPath, args...)
 
 	// Stream stdout/stderr to log file + parent terminal so PHP startup
-	// errors are not lost. The extraStderr writer captures the first chunk
-	// of errors for synchronous reporting after a port-timeout below.
+	// errors are not lost. We tee BOTH stdout and stderr into the safeBuffer —
+	// some PHP SAPI builds (notably certain php-cgi builds) write their fatal
+	// startup errors to stdout instead of stderr, so capturing only stderr
+	// leaves the user with an empty diagnostic and a misleading "Periksa log".
 	phpLogDir, _ := phpLogDir()
-	stderrBuffer := newSafeBuffer()
-	attachLogger(cmd, phpLogDir, fmt.Sprintf("php-%s.log", version), stderrBuffer)
+	startupBuffer := newSafeBuffer()
+	attachLogger(cmd, phpLogDir, fmt.Sprintf("php-%s.log", version), startupBuffer)
+	// Also tee stdout into the startup buffer so we catch php-cgi failures
+	// that print to stdout. attachLogger normally wires cmd.Stdout to a
+	// MultiWriter(file, os.Stdout); we wrap it again here to also feed the
+	// startupBuffer. (cmd.Stdout may already be an io.MultiWriter; we just
+	// compose one more level.)
+	if cmd.Stdout != nil {
+		cmd.Stdout = io.MultiWriter(cmd.Stdout, startupBuffer)
+	} else {
+		cmd.Stdout = startupBuffer
+	}
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Sprintf("Error: failed to start PHP %s: %s", version, err.Error())
 	}
 
 	phpProcess = cmd
+	fmt.Printf("[php] started PID %d: %s %v\n", cmd.Process.Pid, binaryPath, args)
 	// Do NOT call Process.Release() — php-cgi (-b) and php-fpm (-F) both run
 	// in foreground mode and stay alive as our child. We want a live handle
 	// for StopPHP (Signal/Kill) + cmd.Wait() (reap zombie).
@@ -861,12 +909,28 @@ func (a *App) StartPHP(version string) string {
 	// on startup (bad config, missing module, port in use) even though
 	// cmd.Start() returned nil.
 	if !waitForPort(phpInternalPort, 3000*time.Millisecond) {
-		stderrText := strings.TrimSpace(stderrBuffer.String())
+		startupText := strings.TrimSpace(startupBuffer.String())
+		// Inspect process exit state: did the child die immediately, or
+		// is it still alive but not listening? This distinguishes a crash
+		// from a silent bind failure.
+		pid := cmd.Process.Pid
+		aliveErr := cmd.Process.Signal(os.Signal(nil))
+		fmt.Printf("[php] waitForPort failed. PID=%d aliveErr=%v startupText=%q\n",
+			pid, aliveErr, startupText)
 		a.StopPHP()
-		if stderrText != "" {
-			return fmt.Sprintf("Error: PHP %s gagal start (port %s tidak listening): %s", version, phpInternalPort, stderrText)
+		// Also probe whether the process is actually still alive — if
+		// php-cgi forked & exited immediately, the port won't come up and
+		// the child may already be a zombie.
+		if startupText != "" {
+			return fmt.Sprintf("Error: PHP %s gagal start (port %s tidak listening): %s", version, phpInternalPort, startupText)
 		}
-		return fmt.Sprintf("Error: PHP %s gagal start (port %s tidak listening dalam 3s). Periksa ~/.zampp/logs/php/php-%s.log", version, phpInternalPort, version)
+		// Process exited silently with no output — give the user something
+		// actionable instead of just "Periksa log" (which is empty).
+		// First verify the binary itself runs at all (e.g. dyld errors).
+		if err := probeBinaryRuns(binaryPath, args); err != nil {
+			return fmt.Sprintf("Error: PHP %s gagal start (port %s tidak listening): binary probe failed: %s", version, phpInternalPort, err.Error())
+		}
+		return fmt.Sprintf("Error: PHP %s gagal start (port %s tidak listening dalam 3s, tidak ada output). Periksa ~/.zampp/logs/php/php-%s.log", version, phpInternalPort, version)
 	}
 
 	sapi := "php-fpm"
