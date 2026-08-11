@@ -19,13 +19,13 @@ import { EventsOn } from '../wailsjs/runtime/runtime';
 
 document.querySelector('#app').innerHTML = `
     <div class="app-window">
-        <!-- SETUP OVERLAY (first-run downloader) -->
-        <div id="setup-screen" class="setup-overlay">
+        <!-- ===== SETUP VIEW (first-run downloader, dedicated page) ===== -->
+        <div id="setup-view" class="setup-view">
             <div class="setup-card">
                 <img class="setup-logo-img" src="${zamppLogo}" alt="ZAMPP">
                 <div class="setup-logo">ZAMPP</div>
-                <div class="setup-title">Setting up ZAMPP...</div>
-                <div class="setup-desc">Downloading server engine, please wait.</div>
+                <div id="setup-title" class="setup-title">Setting up ZAMPP...</div>
+                <div id="setup-desc" class="setup-desc">Downloading server engine, please wait.</div>
                 <div class="setup-progress-wrap">
                     <div id="setup-progress-bar" class="setup-progress-bar" style="width:0%"></div>
                 </div>
@@ -33,66 +33,69 @@ document.querySelector('#app').innerHTML = `
             </div>
         </div>
 
-        <div class="header">
-            <img class="header-logo" src="${zamppLogo}" alt="ZAMPP">
-            <div class="header-text">
-                <h1>ZAMPP</h1>
-                <div class="subtitle">Zero-config Apache MySQL PHP Platform</div>
-            </div>
-        </div>
-
-        <!-- BARIS 1: WEB SERVER -->
-        <div class="service-row">
-            <div class="service-info">
-                <div class="status-light" id="light-web"></div>
-                <div class="details">
-                    <div class="service-name">Web Server</div>
-                    <div class="controls">
-                        <select id="select-engine">
-                            <option value="apache">Apache</option>
-                            <option value="nginx">Nginx</option>
-                        </select>
-                        <select id="select-php">
-                            <option value="7.4">PHP 7.4</option>
-                            <option value="8.1">PHP 8.1</option>
-                            <option value="8.2">PHP 8.2</option>
-                            <option value="8.3">PHP 8.3</option>
-                            <option value="8.4">PHP 8.4</option>
-                            <option value="8.5">PHP 8.5</option>
-                        </select>
-                    </div>
-                    <div class="port-info">Port: 8000</div>
+        <!-- ===== MAIN VIEW (ZAMPP control panel) ===== -->
+        <div id="main-view" class="main-view" style="display:none">
+            <div class="header">
+                <img class="header-logo" src="${zamppLogo}" alt="ZAMPP">
+                <div class="header-text">
+                    <h1>ZAMPP</h1>
+                    <div class="subtitle">Zero-config Apache MySQL PHP Platform</div>
                 </div>
             </div>
-            <button class="btn" id="btn-web">Start</button>
-        </div>
 
-        <!-- BARIS 2: MYSQL -->
-        <div class="service-row">
-            <div class="service-info">
-                <div class="status-light" id="light-mysql"></div>
-                <div class="details">
-                    <div class="service-name">Database</div>
-                    <div class="controls">
-                        <select id="select-mysql" disabled>
-                            <option>MySQL 5.7</option>
-                        </select>
+            <!-- BARIS 1: WEB SERVER -->
+            <div class="service-row">
+                <div class="service-info">
+                    <div class="status-light" id="light-web"></div>
+                    <div class="details">
+                        <div class="service-name">Web Server</div>
+                        <div class="controls">
+                            <select id="select-engine">
+                                <option value="apache">Apache</option>
+                                <option value="nginx">Nginx</option>
+                            </select>
+                            <select id="select-php">
+                                <option value="7.4">PHP 7.4</option>
+                                <option value="8.1">PHP 8.1</option>
+                                <option value="8.2">PHP 8.2</option>
+                                <option value="8.3">PHP 8.3</option>
+                                <option value="8.4">PHP 8.4</option>
+                                <option value="8.5">PHP 8.5</option>
+                            </select>
+                        </div>
+                        <div class="port-info">Port: 8000</div>
                     </div>
-                    <div class="port-info">Port: 3307 • User: root • Pass: root</div>
                 </div>
+                <button class="btn" id="btn-web">Start</button>
             </div>
-            <button class="btn" id="btn-mysql">Start</button>
+
+            <!-- BARIS 2: MYSQL -->
+            <div class="service-row">
+                <div class="service-info">
+                    <div class="status-light" id="light-mysql"></div>
+                    <div class="details">
+                        <div class="service-name">Database</div>
+                        <div class="controls">
+                            <select id="select-mysql" disabled>
+                                <option>MySQL 5.7</option>
+                            </select>
+                        </div>
+                        <div class="port-info">Port: 3307 • User: root • Pass: root</div>
+                    </div>
+                </div>
+                <button class="btn" id="btn-mysql">Start</button>
+            </div>
+
+            <!-- TOOLBAR -->
+            <div class="toolbar">
+                <button class="btn btn-tool" id="btn-webroot">WebRoot</button>
+                <button class="btn btn-tool" id="btn-adminer">Adminer</button>
+                <button class="btn btn-tool" id="btn-terminal">💻 Terminal</button>
+                <button class="btn btn-tool" id="btn-htdocs">📁 Open htdocs</button>
+            </div>
         </div>
 
-        <!-- TOOLBAR -->
-        <div class="toolbar">
-            <button class="btn btn-tool" id="btn-webroot">WebRoot</button>
-            <button class="btn btn-tool" id="btn-adminer">Adminer</button>
-            <button class="btn btn-tool" id="btn-terminal">💻 Terminal</button>
-            <button class="btn btn-tool" id="btn-htdocs">📁 Open htdocs</button>
-        </div>
-
-        <!-- TOAST -->
+        <!-- TOAST (always available for notifications) -->
         <div class="toast" id="toast"></div>
     </div>
 `;
@@ -181,26 +184,27 @@ function checkSelectedPHPVersion() {
         });
 }
 
-// showSetupOverlay(title, desc) displays the first-run-style overlay for
-// either the base engine download or a per-version PHP download.
+// showSetupOverlay(title, desc) switches to the download/setup view: hides
+// the main control panel and shows the dedicated setup card with title and
+// description. Used for either the base engine download (first run) or a
+// per-version PHP download.
 function showSetupOverlay(title, desc) {
-    if (!setupScreen) return;
-    const titleEl = setupScreen.querySelector('.setup-title');
-    const descEl = setupScreen.querySelector('.setup-desc');
+    const titleEl = document.getElementById('setup-title');
+    const descEl = document.getElementById('setup-desc');
     if (titleEl) titleEl.textContent = title;
     if (descEl) descEl.textContent = desc;
     if (setupBar) setupBar.style.width = '0%';
     if (setupPct) setupPct.textContent = '0%';
-    setupScreen.classList.remove('fade-out');
-    setupScreen.style.display = 'flex';
+    if (setupView) setupView.style.display = 'flex';
+    if (mainView) mainView.style.display = 'none';
 }
 
+// hideSetupOverlay switches back to the main ZAMPP control panel after a
+// download completes (or fails). The main view becomes visible and
+// interactive again.
 function hideSetupOverlay() {
-    if (!setupScreen) return;
-    setupScreen.classList.add('fade-out');
-    setTimeout(() => {
-        if (setupScreen) setupScreen.style.display = 'none';
-    }, 600);
+    if (mainView) mainView.style.display = 'block';
+    if (setupView) setupView.style.display = 'none';
 }
 
 function setMySQLRunning(running) {
@@ -451,26 +455,28 @@ setMySQLRunning(false);
 checkSelectedPHPVersion();
 
 // ===== First-run setup flow =====
-const setupScreen = document.getElementById('setup-screen');
+const setupView = document.getElementById('setup-view');
+const mainView = document.getElementById('main-view');
 const setupBar = document.getElementById('setup-progress-bar');
 const setupPct = document.getElementById('setup-percent');
 
 // Listen for download progress events from the Go backend.
 EventsOn('download-progress', (pct) => {
     const value = Math.max(0, Math.min(100, Number(pct) || 0));
+    console.log('[zampp] download-progress:', pct, '->', value);
     if (setupBar) setupBar.style.width = value + '%';
     if (setupPct) setupPct.textContent = value + '%';
 });
 
-// Listen for completion; fade out overlay then hide.
+// Listen for completion; switch from setup view to main ZAMPP control panel.
 EventsOn('download-complete', () => {
     if (setupBar) setupBar.style.width = '100%';
     if (setupPct) setupPct.textContent = '100%';
-    if (!setupScreen) return;
-    setupScreen.classList.add('fade-out');
+    // Tiny delay so the user sees 100% before the view flips.
     setTimeout(() => {
-        if (setupScreen) setupScreen.style.display = 'none';
-    }, 600);
+        if (mainView) mainView.style.display = 'block';
+        if (setupView) setupView.style.display = 'none';
+    }, 400);
 });
 
 // Per-version PHP download progress.
@@ -483,15 +489,20 @@ EventsOn('php-download-progress', (pct) => {
 // Per-version PHP download complete: hide overlay, restore controls, auto-start.
 EventsOn('php-download-complete', onPHPDownloadComplete);
 
-// On load, check if binaries are already installed.
+// On load, decide which view to show:
+//   - Engine already installed → skip the setup view, jump to main panel.
+//   - First run / not installed → stay on setup view and start downloading.
 CheckFirstRun()
     .then((installed) => {
         if (installed) {
-            // Already set up — hide overlay immediately.
-            if (setupScreen) setupScreen.style.display = 'none';
+            // Already set up — go straight to the main ZAMPP control panel.
+            if (mainView) mainView.style.display = 'block';
+            if (setupView) setupView.style.display = 'none';
             return;
         }
-        // First run — keep overlay visible and start the download.
+        // First run — keep the setup view visible (it is the default visible
+        // view in the HTML) and start the download. Progress events will
+        // update the bar; 'download-complete' will flip to the main view.
         DownloadAndExtractBinaries().catch((err) => {
             const msg = typeof err === 'string' ? err : String(err);
             if (setupPct) setupPct.textContent = 'Error: ' + msg;

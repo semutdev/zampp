@@ -238,8 +238,12 @@ select:disabled {
     color: var(--danger);
 }
 
-/* ===== First-run setup overlay ===== */
-.setup-overlay {
+/* ===== First-run setup view (dedicated download page) =====
+   The setup view is a full-window "page" rather than an overlay on top
+   of the main UI. It is shown alone during the first-run engine download
+   and for per-version PHP downloads; when the download completes, the
+   app flips to #main-view. */
+.setup-view {
     position: absolute;
     inset: 0;
     z-index: 9999;
@@ -248,12 +252,16 @@ select:disabled {
     display: flex;
     align-items: center;
     justify-content: center;
-    transition: opacity 600ms ease-out;
 }
 
-.setup-overlay.fade-out {
+.setup-view.fade-out {
     opacity: 0;
     pointer-events: none;
+}
+
+/* Main ZAMPP control panel view (header + service rows + toolbar) */
+.main-view {
+    display: block;
 }
 
 .setup-card {

@@ -313,14 +313,22 @@ func (a *App) downloadWithProgress(url, destPath, eventName string) (int64, erro
 	}
 
 	total := resp.ContentLength
+	fmt.Printf("[download] %s -> %s (ContentLength=%d)\n", url, destPath, total)
 	out, err := os.Create(destPath)
 	if err != nil {
 		return total, fmt.Errorf("cannot create temp file %s: %w", destPath, err)
 	}
 
+	// Emit a "starting" 0% so the UI shows activity even before the first
+	// full 1% chunk arrives (for a 529MB download, 1% = ~5MB which can take
+	// a few seconds on slow connections — during which the bar would appear
+	// stuck without this initial ping).
+	runtime.EventsEmit(a.ctx, eventName, 0)
+	fmt.Printf("[download] emit %s = 0%%\n", eventName)
+
 	var downloaded int64
 	buf := make([]byte, 32*1024)
-	lastPct := -1
+	lastPct := 0
 	for {
 		n, readErr := resp.Body.Read(buf)
 		if n > 0 {
@@ -334,6 +342,25 @@ func (a *App) downloadWithProgress(url, destPath, eventName string) (int64, erro
 				if pct > lastPct && pct <= 100 {
 					lastPct = pct
 					runtime.EventsEmit(a.ctx, eventName, pct)
+					// Log every 5% to terminal so we can confirm the Go side
+					// is actually emitting events even if the frontend
+					// listener is silent (helps diagnose Wails dev-mode
+					// event delivery issues).
+					if pct%5 == 0 {
+						fmt.Printf("[download] emit %s = %d%% (%d / %d bytes)\n",
+							eventName, pct, downloaded, total)
+					}
+				}
+			} else {
+				// Unknown total — emit a pseudo-progress based on bytes
+				// downloaded so the UI shows something moving. We bend the
+				// 0-100 contract here only while Content-Length is absent;
+				// once we know the real total, we switch back.
+				mbDownloaded := downloaded / (1024 * 1024)
+				pseudo := int(mbDownloaded % 100)
+				if pseudo != lastPct {
+					lastPct = pseudo
+					runtime.EventsEmit(a.ctx, eventName, pseudo)
 				}
 			}
 		}
@@ -346,6 +373,7 @@ func (a *App) downloadWithProgress(url, destPath, eventName string) (int64, erro
 		}
 	}
 	out.Close()
+	fmt.Printf("[download] %s done (%d bytes)\n", url, downloaded)
 	return total, nil
 }
 
