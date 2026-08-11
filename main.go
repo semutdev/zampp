@@ -18,12 +18,20 @@ func main() {
 	// Create an instance of the app structure
 	app := NewApp()
 
-	// Catch SIGINT/SIGTERM (kill, Ctrl-C) and stop all engines so that
+	// Catch SIGINT (Ctrl-C) and stop all engines so that
 	// nginx/httpd/mysqld/php do not leak as orphans bound to 8000/3307/8001.
-	// Wails' OnShutdown handles normal close, but force-quit / SIGTERM can
-	// bypass it — this signal handler covers that gap.
+	//
+	// IMPORTANT: We deliberately do NOT listen for SIGTERM or SIGHUP here.
+	// With Apache started via -DFOREGROUND and nginx via `daemon off;`, those
+	// processes are direct children of this Go process. When the user clicks
+	// Stop, StopApache/StopNginx send SIGTERM to the child; that signal can
+	// propagate (or be observed via SIGHUP from workers) by the parent Go
+	// process. If we listened for SIGTERM/SIGHUP, the signal handler would
+	// fire during a normal Stop click, call stopAllEngines again, and then
+	// os.Exit(0) — which force-closes the app every time the user Stops a
+	// service. Wails' OnShutdown hook + this SIGINT handler are enough.
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	signal.Notify(sigCh, syscall.SIGINT)
 	go func() {
 		<-sigCh
 		app.stopAllEngines()

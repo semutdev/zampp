@@ -2105,7 +2105,18 @@ func (a *App) StartApache() string {
 	// Defensive cleanup of any stale httpd on our port.
 	a.stopApacheOnPort()
 
-	cmd := exec.Command(binaryPath, "-DFOREGROUND", "-f", confPath)
+	// -X is Apache's "debug mode" flag: single worker, does NOT detach from
+	// the controlling terminal. This is what we actually want — without -X,
+	// httpd daemonizes (parent forks workers and exits immediately), which
+	// left us with no live process handle and caused the Stop button to
+	// force-close the app via SIGCHLD/SIGHUP race. With -X, the httpd parent
+	// stays as a direct child of this Go process and StopApache can reliably
+	// signal + Wait for it.
+	//
+	// Note: Apache does NOT have a -DFOREGROUND define (common misconception).
+	// The `-D name` flag only defines names for <IfDefine name> blocks in the
+	// config; it does not change the daemonize behavior of MPM prefork.
+	cmd := exec.Command(binaryPath, "-X", "-f", confPath)
 
 	// Stream stdout/stderr to log file + parent terminal so httpd startup
 	// errors (dyld "Library not loaded", missing modules, bind failures)
