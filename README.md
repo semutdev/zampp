@@ -18,14 +18,16 @@ No more dealing with complex port setups or memory-heavy applications. Just one 
 - **Zero-config:** Just click "Start" and start coding. No configuration file headaches.
 - **Native macOS UI:** Built with Golang and Wails, delivering a clean, lightweight interface that blends perfectly with the macOS environment.
 - **Modular Architecture:** The main installer is incredibly small! Additional PHP versions (7.4 - 8.5) can be downloaded directly from within the app only when you need them (*On-Demand Download*).
+- **Multi PHP Version** ZAMPP can switch multi php Version
 - **Fast Startup:** Nginx/Apache, MySQL, and PHP engines run independently in the background at maximum speed.
+- **Terminal Smart** Auto switch php and composer direct to terminal
 
 ---
 
 ## Installation Guide
 
 1. Visit the [**Releases**](https://github.com/semutdev/zampp/releases/latest) page.
-2. Download the **`ZAMPP-macOS.dmg`** file (Do not download the engine zip files manually).
+2. Download For Mac the [**ZAMPP-macOS.dmg**](https://github.com/semutdev/zampp/releases/download/v1.0.0/ZAMPP-macOS.dmg) file (Do not download the engine zip files manually).
 3. Open the downloaded `.dmg` file and drag **`ZAMPP.app`** into your `Applications` folder.
 4. Launch the ZAMPP app. *(On the first run, the app will automatically download the base server engines in the background).*
 
