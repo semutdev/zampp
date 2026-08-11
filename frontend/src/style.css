@@ -242,21 +242,28 @@ select:disabled {
    The setup view is a full-window "page" rather than an overlay on top
    of the main UI. It is shown alone during the first-run engine download
    and for per-version PHP downloads; when the download completes, the
-   app flips to #main-view. */
+   app flips to #main-view.
+
+   IMPORTANT: this view is the only visible child of .app-window during
+   first run (main-view is display:none). Without an explicit height,
+   .app-window collapses to 0 and the user sees a blank window. We
+   therefore set height:100vh on .app-window via .setup-view being
+   normal flow (not position:absolute) so its content drives layout. */
 .setup-view {
-    position: absolute;
-    inset: 0;
-    z-index: 9999;
+    min-height: 100vh;
+    box-sizing: border-box;
     background: linear-gradient(160deg, #1d1d1f 0%, #2c2c2e 100%);
     color: #f5f5f7;
     display: flex;
     align-items: center;
     justify-content: center;
+    padding: 24px;
 }
 
 .setup-view.fade-out {
     opacity: 0;
     pointer-events: none;
+    transition: opacity 400ms ease-out;
 }
 
 /* Main ZAMPP control panel view (header + service rows + toolbar) */

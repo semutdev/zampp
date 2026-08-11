@@ -17,14 +17,18 @@ import {
 } from '../wailsjs/go/main/App';
 import { EventsOn } from '../wailsjs/runtime/runtime';
 
-// Global error catcher — surface any load-time exception so the user
-// sees what went wrong instead of a blank white window.
-window.addEventListener('error', (e) => {
-    console.error('[zampp fatal]', e.message, e.filename + ':' + e.lineno);
-});
-window.addEventListener('unhandledrejection', (e) => {
-    console.error('[zampp unhandled rejection]', e.reason);
-});
+// Global error catchers — surface any load-time exception in the
+// DevTools console so users see the cause instead of a blank window.
+try {
+    window.addEventListener('error', (e) => {
+        console.error('[zampp fatal]', e.message, e.filename + ':' + e.lineno);
+    });
+    window.addEventListener('unhandledrejection', (e) => {
+        console.error('[zampp unhandled rejection]', e.reason);
+    });
+} catch (e) {
+    console.error('[zampp] failed to attach error handlers', e);
+}
 
 document.querySelector('#app').innerHTML = `
     <div class="app-window">
