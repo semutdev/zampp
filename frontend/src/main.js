@@ -17,6 +17,15 @@ import {
 } from '../wailsjs/go/main/App';
 import { EventsOn } from '../wailsjs/runtime/runtime';
 
+// Global error catcher — surface any load-time exception so the user
+// sees what went wrong instead of a blank white window.
+window.addEventListener('error', (e) => {
+    console.error('[zampp fatal]', e.message, e.filename + ':' + e.lineno);
+});
+window.addEventListener('unhandledrejection', (e) => {
+    console.error('[zampp unhandled rejection]', e.reason);
+});
+
 document.querySelector('#app').innerHTML = `
     <div class="app-window">
         <!-- ===== SETUP VIEW (first-run downloader, dedicated page) ===== -->
