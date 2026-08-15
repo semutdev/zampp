@@ -1,3 +1,5 @@
+//go:build windows
+
 package main
 
 import (
@@ -6,16 +8,16 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
-	"os/user"
 	"path/filepath"
 	goruntime "runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
@@ -64,7 +66,7 @@ func (a *App) startup(ctx context.Context) {
 
 // shutdown is called when the app is closing (normal close, Cmd+Q, or
 // window close). It stops every engine ZAMPP started so that
-// http://127.0.0.1:8000, the PHP built-in server, and MySQL do not keep
+// http://127.0.0.1:9000, the PHP built-in server, and MySQL do not keep
 // running in the background after the app exits. Without this hook, a
 // force-quit leaves orphan daemons bound to our ports.
 func (a *App) shutdown(ctx context.Context) {
@@ -85,21 +87,94 @@ func (a *App) stopAllEngines() {
 
 const appDirName = ".zampp"
 
-// mySQLPort is the TCP port used by the standalone mysqld. It is set to 3307
+// mySQLPort is the TCP port used by the standalone mysqld. It is set to 3309
 // (instead of MySQL's default 3306) to avoid clashes with XAMPP's MySQL on 3306.
-const mySQLPort = "3307"
+const mySQLPort = "3309"
 
-// nginxPort is the public-facing port for Nginx.
-const nginxPort = "8000"
+// nginxPort is the public-facing port for Nginx on Windows.
+const nginxPort = "9000"
 
-// apachePort is the public-facing port for Apache. Now equal to nginxPort
-// (8000) so the UI can treat them as a single "Web Server" slot — the user
+// apachePort is the public-facing port for Apache on Windows. Now equal to nginxPort
+// (9000) so the UI can treat them as a single "Web Server" slot — the user
 // picks either engine via the dropdown, never both at once.
-const apachePort = "8000"
+const apachePort = "9000"
 
 // phpInternalPort is the internal PHP built-in server port that Nginx/Apache
 // proxy PHP requests to. The UI does not need to know about this port.
-const phpInternalPort = "8001"
+const phpInternalPort = "9001"
+
+// isProcessAlive checks if a command process is still actively running on Windows.
+func isProcessAlive(cmd *exec.Cmd) bool {
+	if cmd == nil || cmd.Process == nil || cmd.Process.Pid <= 0 {
+		return false
+	}
+	out, err := exec.Command("tasklist", "/FI", fmt.Sprintf("PID eq %d", cmd.Process.Pid), "/NH").Output()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(out), fmt.Sprintf("%d", cmd.Process.Pid))
+}
+
+// getPIDsOnPort returns all process IDs currently listening on the given TCP port on Windows via netstat.
+func getPIDsOnPort(port string) []string {
+	out, err := exec.Command("netstat", "-ano", "-p", "tcp").Output()
+	if err != nil {
+		return nil
+	}
+	var pids []string
+	seen := make(map[string]bool)
+	lines := strings.Split(string(out), "\n")
+	targetSuffix := ":" + port
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if !strings.Contains(line, "LISTENING") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 5 {
+			continue
+		}
+		localAddr := fields[1]
+		if strings.HasSuffix(localAddr, targetSuffix) {
+			pid := fields[len(fields)-1]
+			if pid != "" && pid != "0" && !seen[pid] {
+				seen[pid] = true
+				pids = append(pids, pid)
+			}
+		}
+	}
+	return pids
+}
+
+// killProcessByPID kills a process by its PID using native Go os.FindProcess and Kill(),
+// with taskkill /F /T /PID as a fallback on Windows.
+func killProcessByPID(pid int) error {
+	if pid <= 0 {
+		return nil
+	}
+	if proc, err := os.FindProcess(pid); err == nil {
+		_ = proc.Kill()
+	}
+	cmd := exec.Command("taskkill", "/F", "/T", "/PID", fmt.Sprintf("%d", pid))
+	_ = cmd.Run()
+	return nil
+}
+
+// killPIDString terminates a process identified by PID string on Windows.
+func killPIDString(pidStr string) error {
+	pidStr = strings.TrimSpace(pidStr)
+	if pidStr == "" || pidStr == "0" || strings.HasPrefix(pidStr, "-") {
+		return nil
+	}
+	pid, err := strconv.Atoi(pidStr)
+	if err == nil && pid > 0 {
+		if proc, err := os.FindProcess(pid); err == nil {
+			_ = proc.Kill()
+		}
+	}
+	cmd := exec.Command("taskkill", "/F", "/T", "/PID", pidStr)
+	return cmd.Run()
+}
 
 // mysqlProcess holds a reference to the running mysqld process (if any).
 // It is managed via StartMySQL / StopMySQL.
@@ -176,13 +251,13 @@ func attachLogger(cmd *exec.Cmd, engineLogDir string, filename string, extraStde
 }
 
 // appRootDir returns the absolute path to the app's root directory
-// inside the user's home directory (e.g. /Users/jamal/.zampp).
+// inside the user's home directory (e.g. C:\Users\user\.zampp).
 func appRootDir() (string, error) {
-	u, err := user.Current()
+	home, err := homeDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(u.HomeDir, appDirName), nil
+	return filepath.Join(home, appDirName), nil
 }
 
 // htdocsPath returns the absolute path to the htdocs directory.
@@ -230,13 +305,19 @@ func (a *App) CheckFirstRun() bool {
 		return false
 	}
 	// Required base binaries for the engine to be considered "installed".
-	// Mirrors the package-engine.sh validation set (excluding php/7.4).
 	required := []string{
-		filepath.Join(root, "bin", "apache", "httpd"),
-		filepath.Join(root, "bin", "nginx", "nginx"),
-		filepath.Join(root, "bin", "mysql", "bin", "mysqld"),
+		filepath.Join(root, "bin", "apache", "bin", "httpd.exe"),
+		filepath.Join(root, "bin", "nginx", "nginx.exe"),
+		filepath.Join(root, "bin", "mysql", "bin", "mysqld.exe"),
 	}
 	for _, p := range required {
+		// Also allow apache directly under bin/apache/httpd.exe
+		if strings.Contains(p, "apache") {
+			altPath := filepath.Join(root, "bin", "apache", "httpd.exe")
+			if info, err := os.Stat(altPath); err == nil && !info.IsDir() {
+				continue
+			}
+		}
 		info, err := os.Stat(p)
 		if err != nil {
 			return false
@@ -250,20 +331,17 @@ func (a *App) CheckFirstRun() bool {
 
 // binariesZipURL is the GitHub release URL for the ZAMPP engine bundle
 // (contains .zampp/bin and .zampp/conf at the archive root).
-const binariesZipURL = "https://github.com/semutdev/zampp/releases/download/v1.0.0/zampp-mac-x64-v1.zip"
+const binariesZipURL = "https://github.com/semutdev/zampp/releases/download/v1.0.0/zampp-win-x64-v1.zip"
 
 // DownloadAndExtractBinaries downloads the engine zip from GitHub releases,
 // streaming 'download-progress' events (0-100) to the frontend, then
-// extracts it into the user's home directory. Because the zip already
-// contains the .zampp/ root folder, extraction lands at ~/.zampp/bin and
-// ~/.zampp/conf. The temporary download at /tmp/zampp-engine.zip is
-// deleted at the end, and a 'download-complete' event is emitted.
+// extracts it into the user's home directory.
 func (a *App) DownloadAndExtractBinaries() error {
 	if a.ctx == nil {
 		return fmt.Errorf("app context not initialized")
 	}
 
-	const tmpZip = "/tmp/zampp-engine.zip"
+	tmpZip := filepath.Join(os.TempDir(), "zampp-engine.zip")
 
 	// 1) Download with progress streaming.
 	total, err := a.downloadWithProgress(binariesZipURL, tmpZip, "download-progress")
@@ -421,11 +499,10 @@ func phpVersionZipURL(version string) string {
 // given version (e.g. "8.2").
 //
 // Flow:
-//  1. Download https://github.com/semutdev/zampp/releases/download/v1.0.0/php-{version}-{mac|win}.zip
-//     to /tmp/php-{version}-{mac|win}.zip, emitting 'php-download-progress' (0-100).
-//     The OS suffix is selected at runtime via goruntime.GOOS.
+//  1. Download https://github.com/semutdev/zampp/releases/download/v1.0.0/php-{version}-win.zip
+//     to temp zip in os.TempDir(), emitting 'php-download-progress' (0-100).
 //  2. Extract into ~/.zampp/bin/php/ (zip already contains a top-level {version} folder).
-//  3. Delete /tmp/php-{version}-{mac|win}.zip.
+//  3. Delete temp zip file.
 //  4. Emit 'php-download-complete'.
 //
 // The base engine (DownloadAndExtractBinaries) is independent and remains
@@ -455,9 +532,9 @@ func (a *App) DownloadPHPVersion(version string) error {
 	case "windows":
 		osSuffix = "win"
 	default:
-		osSuffix = "mac"
+		osSuffix = "win"
 	}
-	tmpZip := fmt.Sprintf("/tmp/php-%s-%s.zip", version, osSuffix)
+	tmpZip := filepath.Join(os.TempDir(), fmt.Sprintf("php-%s-%s.zip", version, osSuffix))
 	url := phpVersionZipURL(version)
 
 	// 1) Download with progress streaming.
@@ -534,8 +611,8 @@ func extractZipToDir(zipPath, destDir string) error {
 // getPHPExecutablePath resolves the PHP binary path for the given version,
 // supporting two installation layouts:
 //
-//	Jalur A (SPC)  : ~/.zampp/bin/php/{version}/php
-//	Jalur B (MAMP) : ~/.zampp/bin/php/{version}/bin/php
+//	Jalur A (SPC)  : ~/.zampp/bin/php/{version}/php.exe
+//	Jalur B (MAMP) : ~/.zampp/bin/php/{version}/bin/php.exe
 //
 // It checks Jalur A first, then Jalur B. If a regular file is found at either
 // location, its absolute path is returned. If neither exists, an error is
@@ -547,8 +624,10 @@ func getPHPExecutablePath(version string) (string, error) {
 	}
 
 	candidates := []string{
-		filepath.Join(base, version, "php"),      // Jalur A (SPC)
-		filepath.Join(base, version, "bin", "php"), // Jalur B (MAMP)
+		filepath.Join(base, version, "php.exe"),      // Jalur A (SPC)
+		filepath.Join(base, version, "bin", "php.exe"), // Jalur B (MAMP)
+		filepath.Join(base, version, "php"),
+		filepath.Join(base, version, "bin", "php"),
 	}
 
 	for _, p := range candidates {
@@ -559,7 +638,7 @@ func getPHPExecutablePath(version string) (string, error) {
 	}
 
 	return "", fmt.Errorf(
-		"Binary PHP %s belum terpasang di ~/.zampp/bin/php/%s/ (diperiksa: ./php dan ./bin/php)",
+		"Binary PHP %s belum terpasang di ~/.zampp/bin/php/%s/ (diperiksa: ./php.exe dan ./bin/php.exe)",
 		version, version,
 	)
 }
@@ -585,13 +664,13 @@ func mysqlDataDir() (string, error) {
 }
 
 // mysqldPath returns the absolute path to the mysqld binary
-// (e.g. ~/.zampp/bin/mysql/bin/mysqld).
+// (e.g. ~/.zampp/bin/mysql/bin/mysqld.exe).
 func mysqldPath() (string, error) {
 	base, err := mysqlBaseDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(base, "bin", "mysqld"), nil
+	return filepath.Join(base, "bin", "mysqld.exe"), nil
 }
 
 // mysqlSocketPath returns the absolute path to the MySQL Unix socket file.
@@ -670,12 +749,12 @@ func isPHPInstalled(version string) bool {
 // phpVariantForVersion decides which PHP SAPI binary to launch for a given
 // version and how to address it (FastCGI bind target).
 //
-//   - 7.4   → php-cgi -b 127.0.0.1:8001          (CGI, ships with base engine)
+//   - 7.4   → php-cgi -b 127.0.0.1:9001          (CGI, ships with base engine)
 //   - 8.x+  → php-fpm --fpm-config <dynamic.conf> (FPM, modular downloads)
 //
 // php-fpm cannot bind to a port via a CLI flag — it must be configured through
 // an FPM pool config file. writePHPFPMConfig generates a minimal config at
-// ~/.zampp/config/php-fpm-{version}.conf with `listen = 127.0.0.1:8001`.
+// ~/.zampp/config/php-fpm-{version}.conf with `listen = 127.0.0.1:9001`.
 //
 // Returns the resolved absolute binary path and the arg slice to pass to exec.
 func phpLaunchCommand(version string) (binaryPath string, args []string, err error) {
@@ -684,10 +763,12 @@ func phpLaunchCommand(version string) (binaryPath string, args []string, err err
 		return "", nil, err
 	}
 
-	// Candidates: php-cgi / php-fpm may sit next to php (SPC layout) or
+	// Candidates: php-cgi.exe / php-fpm.exe may sit next to php (SPC layout) or
 	// inside a bin/ subfolder (MAMP layout).
 	lookup := func(name string) (string, bool) {
 		for _, p := range []string{
+			filepath.Join(base, version, name+".exe"),
+			filepath.Join(base, version, "bin", name+".exe"),
 			filepath.Join(base, version, name),
 			filepath.Join(base, version, "bin", name),
 		} {
@@ -709,23 +790,24 @@ func phpLaunchCommand(version string) (binaryPath string, args []string, err err
 
 	bp, ok := lookup(sapiName)
 	if !ok {
-		// Construct a precise, actionable error. Start with "Error:" so
-		// StartWebServer can detect this via HasPrefix and roll back the
-		// Apache/Nginx start — without that, the frontend would still
-		// proceed to start the web server and the user would see a vague
-		// "Service Unavailable" 503 from Apache (which can't reach the
-		// never-started PHP FastCGI worker on 8001) instead of the real
-		// cause: the PHP SAPI binary is missing from the released zip.
-		//
-		// We detect two scenarios:
-		//   1) Version dir exists but only ships `php` (CLI), no SAPI.
-		//      This is a packaging issue in the released PHP zip.
-		//   2) Version dir doesn't exist at all — version not installed.
+		// Also fallback to checking php-cgi for 8.x if php-fpm is missing (common on Windows)
+		if !isCGI {
+			if bpCgi, okCgi := lookup("php-cgi"); okCgi {
+				bp = bpCgi
+				isCGI = true
+				sapiName = "php-cgi"
+				ok = true
+			}
+		}
+	}
+
+	if !ok {
 		verDir := filepath.Join(base, version)
 		cliOnly := false
 		if info, statErr := os.Stat(verDir); statErr == nil && info.IsDir() {
-			// Version folder exists. Does it have any `php` binary (CLI)?
 			for _, candidate := range []string{
+				filepath.Join(verDir, "php.exe"),
+				filepath.Join(verDir, "bin", "php.exe"),
 				filepath.Join(verDir, "php"),
 				filepath.Join(verDir, "bin", "php"),
 			} {
@@ -737,16 +819,15 @@ func phpLaunchCommand(version string) (binaryPath string, args []string, err err
 		}
 		if cliOnly {
 			return "", nil, fmt.Errorf(
-				"Error: PHP %s hanya berisi binary CLI (php), tanpa %s. "+
+				"Error: PHP %s hanya berisi binary CLI (php.exe), tanpa %s.exe. "+
 					"Bundel zip untuk PHP %s tidak menyertakan SAPI FastCGI — "+
-					"re-pack zip-nya agar menyertakan php-fpm (untuk versi 8.x) "+
-					"atau php-cgi (untuk 7.4). Lihat: ~/.zampp/bin/php/%s/",
+					"re-pack zip-nya agar menyertakan php-cgi.exe atau php-fpm.exe. Lihat: ~/.zampp/bin/php/%s/",
 				version, sapiName, version, version,
 			)
 		}
 		return "", nil, fmt.Errorf(
 			"Error: %s untuk PHP %s belum terpasang di ~/.zampp/bin/php/%s/ "+
-				"(diperiksa: ./%s dan ./bin/%s). Pastikan versi PHP tersebut sudah di-download.",
+				"(diperiksa: ./%s.exe dan ./bin/%s.exe). Pastikan versi PHP tersebut sudah di-download.",
 			sapiName, version, version, sapiName, sapiName,
 		)
 	}
@@ -761,20 +842,11 @@ func phpLaunchCommand(version string) (binaryPath string, args []string, err err
 	if err != nil {
 		return "", nil, fmt.Errorf("cannot write php-fpm config: %w", err)
 	}
-	// -F keeps FPM in the foreground so the spawned process keeps running.
-	// Without -F, php-fpm daemonizes and the master exits immediately,
-	// leaving cmd.Start() with a defunct process.
-	return bp, []string{"-F", "--fpm-config", cfgPath}, nil
+	return bp, []string{"-F", "--fpm-config", filepath.ToSlash(cfgPath)}, nil
 }
 
 // writePHPFPMConfig renders the minimal FPM pool config for a PHP version
 // into ~/.zampp/config/php-fpm-{version}.conf and returns its absolute path.
-//
-// listen = 127.0.0.1:8001 — the internal FastCGI port Nginx/Apache proxies to.
-// pm = dynamic with conservative child counts suitable for local dev.
-//
-// The directory ~/.zampp/config is created on demand (ensureAppDirs also
-// creates it during startup; this is a per-call safety net).
 func writePHPFPMConfig(version string) (string, error) {
 	root, err := appRootDir()
 	if err != nil {
@@ -786,9 +858,12 @@ func writePHPFPMConfig(version string) (string, error) {
 	}
 
 	cfgPath := filepath.Join(cfgDir, fmt.Sprintf("php-fpm-%s.conf", version))
+	pidPath := filepath.ToSlash(filepath.Join(os.TempDir(), "zampp-php-fpm.pid"))
+	logPath := filepath.ToSlash(filepath.Join(os.TempDir(), "zampp-php-fpm.log"))
+
 	content := fmt.Sprintf(`[global]
-pid = /tmp/zampp-php-fpm.pid
-error_log = /tmp/zampp-php-fpm.log
+pid = %s
+error_log = %s
 
 [www]
 listen = 127.0.0.1:%s
@@ -797,7 +872,7 @@ pm.max_children = 5
 pm.start_servers = 2
 pm.min_spare_servers = 1
 pm.max_spare_servers = 3
-`, phpInternalPort)
+`, pidPath, logPath, phpInternalPort)
 
 	if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {
 		return "", fmt.Errorf("cannot write php-fpm config %s: %w", cfgPath, err)
@@ -807,17 +882,8 @@ pm.max_spare_servers = 3
 
 // probeBinaryRuns executes the PHP SAPI binary briefly (with the same args
 // StartPHP would use) to catch immediate-failure errors that don't reach the
-// listening stage — most notably "dyld: Library not loaded" on macOS when the
-// bundled PHP was packaged without required shared libs. We run the binary
-// with a 1200ms timeout. A nil error means it ran long enough that we
-// couldn't gather diagnostic info either way; non-nil means we captured a
-// startup error.
-//
-// We use a separate exec.Cmd (not the one StartPHP already started) so the
-// original process state is not perturbed.
+// listening stage. We run the binary with a 1200ms timeout.
 func probeBinaryRuns(binaryPath string, args []string) error {
-	// For php-cgi, ask for -v (version) — that exercises dyld and core
-	// library loading without binding any port. For php-fpm, -v also works.
 	probe := exec.Command(binaryPath, "-v")
 	out, err := probe.CombinedOutput()
 	if err != nil {
@@ -830,14 +896,14 @@ func probeBinaryRuns(binaryPath string, args []string) error {
 	return nil
 }
 
-// StartPHP launches the PHP FastCGI worker on 127.0.0.1:8001 for the given
+// StartPHP launches the PHP FastCGI worker on 127.0.0.1:9001 for the given
 // version. The worker is spawned in the background (non-blocking) using
-// cmd.Start(); Nginx/Apache on :8000 then proxies .php requests here.
+// cmd.Start(); Nginx/Apache on :9000 then proxies .php requests here.
 //
 // Version-specific SAPI:
-//   - 7.4   → php-cgi -b 127.0.0.1:8001
+//   - 7.4   → php-cgi -b 127.0.0.1:9001
 //   - 8.x+  → php-fpm -F --fpm-config ~/.zampp/config/php-fpm-{version}.conf
-//             (config carries `listen = 127.0.0.1:8001`)
+//             (config carries `listen = 127.0.0.1:9001`)
 func (a *App) StartPHP(version string) string {
 	if version == "" {
 		return "Error: PHP version is empty"
@@ -914,9 +980,9 @@ func (a *App) StartPHP(version string) string {
 		// is it still alive but not listening? This distinguishes a crash
 		// from a silent bind failure.
 		pid := cmd.Process.Pid
-		aliveErr := cmd.Process.Signal(os.Signal(nil))
-		fmt.Printf("[php] waitForPort failed. PID=%d aliveErr=%v startupText=%q\n",
-			pid, aliveErr, startupText)
+		isAlive := isProcessAlive(cmd)
+		fmt.Printf("[php] waitForPort failed. PID=%d isAlive=%v startupText=%q\n",
+			pid, isAlive, startupText)
 		a.StopPHP()
 		// Also probe whether the process is actually still alive — if
 		// php-cgi forked & exited immediately, the port won't come up and
@@ -940,7 +1006,7 @@ func (a *App) StartPHP(version string) string {
 	return fmt.Sprintf("Started PHP %s (%s) on 127.0.0.1:%s (docroot: %s)", version, sapi, phpInternalPort, docRoot)
 }
 
-// StopPHP stops the PHP process currently listening on the internal port (8001).
+// StopPHP stops the PHP process currently listening on the internal port (9001).
 func (a *App) StopPHP() (result string) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -948,50 +1014,28 @@ func (a *App) StopPHP() (result string) {
 		}
 	}()
 
-	// Primary path: kill the tracked PHP process if we still hold a reference
-	// to it. Never target a process group (no -PID, no PID 0 or negative).
+	var messages []string
+
+	// Primary path: kill the tracked PHP process using native Go os.Process.Kill()
 	if phpProcess != nil && phpProcess.Process != nil {
 		pid := phpProcess.Process.Pid
 		if pid > 0 {
-			// SIGTERM first so php-fpm/php-cgi can clean up.
-			if err := phpProcess.Process.Signal(syscall.SIGTERM); err != nil {
-				_ = phpProcess.Process.Kill()
-			}
-			// Reap zombie in background.
+			_ = phpProcess.Process.Kill()
+			_ = killProcessByPID(pid)
 			go func(c *exec.Cmd) {
 				if c != nil {
 					_ = c.Wait()
 				}
 			}(phpProcess)
-			phpProcess = nil
-			return fmt.Sprintf("stopped PHP (PID %d)", pid)
+			messages = append(messages, fmt.Sprintf("stopped PHP (PID %d)", pid))
 		}
 		phpProcess = nil
 	}
 
-	// Secondary fallback: find the listener on the PHP internal port via lsof
-	// and kill that exact PID only.
-	out, err := exec.Command("lsof", "-ti", "tcp:"+phpInternalPort, "-sTCP:LISTEN").Output()
-	if err != nil {
-		return "Info: no process found on PHP port " + phpInternalPort + " (already stopped)"
-	}
-
-	pids := strings.TrimSpace(string(out))
-	if pids == "" {
-		return "Info: no process found on PHP port " + phpInternalPort + " (already stopped)"
-	}
-
-	var messages []string
-	for _, pid := range strings.Split(pids, "\n") {
-		pid = strings.TrimSpace(pid)
-		if pid == "" {
-			continue
-		}
-		// Safety: never kill PID 0 or non-numeric/negative values.
-		if pid == "0" || strings.HasPrefix(pid, "-") {
-			continue
-		}
-		if err := exec.Command("kill", "-TERM", pid).Run(); err != nil {
+	// Secondary fallback: find any listener on the PHP internal port via netstat and kill
+	pids := getPIDsOnPort(phpInternalPort)
+	for _, pid := range pids {
+		if err := killPIDString(pid); err != nil {
 			messages = append(messages, fmt.Sprintf("failed to kill PID %s: %s", pid, err.Error()))
 		} else {
 			messages = append(messages, fmt.Sprintf("stopped PID %s", pid))
@@ -999,7 +1043,7 @@ func (a *App) StopPHP() (result string) {
 	}
 
 	if len(messages) == 0 {
-		return "Info: no process stopped"
+		return "Info: no process found on PHP port " + phpInternalPort + " (already stopped)"
 	}
 	return strings.Join(messages, "; ")
 }
@@ -1049,13 +1093,13 @@ func nginxBaseDir() (string, error) {
 }
 
 // nginxBinaryPath returns the absolute path to the nginx binary
-// (e.g. ~/.zampp/bin/nginx/nginx).
+// (e.g. ~/.zampp/bin/nginx/nginx.exe).
 func nginxBinaryPath() (string, error) {
 	base, err := nginxBaseDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(base, "nginx"), nil
+	return filepath.Join(base, "nginx.exe"), nil
 }
 
 // nginxConfDir returns the absolute path to the Nginx config directory
@@ -1118,13 +1162,6 @@ func (a *App) IsNginxInstalled() bool {
 // nginxTempDirs returns the list of temp directories nginx needs writable
 // access to at runtime: client_body, proxy, fastcgi, uwsgi, scgi temp paths
 // under ~/.zampp/tmp/nginx/.
-//
-// Without these, nginx falls back to its compile-time defaults — for the
-// ZAMPP binary those are baked-in as /Applications/MAMP/... paths which do
-// not exist on end-user machines, producing errors like
-//   mkdir() "/Applications/MAMP/Library/client_body_temp" failed (2: No such file or directory)
-// We override via `client_body_temp_path` etc in nginx.conf AND pre-create
-// them here so the first request doesn't 500 trying to mkdir on the fly.
 func nginxTempDirs() ([]string, error) {
 	root, err := appRootDir()
 	if err != nil {
@@ -1146,9 +1183,7 @@ func nginxTempDirs() ([]string, error) {
 }
 
 // ensureNginxTempDirs creates the nginx temp directories and the nginx log
-// directory before nginx is started. All paths are absolute under ~/.zampp/
-// so they are writable regardless of where the nginx binary was compiled to
-// expect logs and temp files.
+// directory before nginx is started.
 func ensureNginxTempDirs() error {
 	logDir, err := nginxLogDir()
 	if err != nil {
@@ -1196,73 +1231,47 @@ func GenerateNginxConfig() error {
 	if err := os.MkdirAll(logDir, 0755); err != nil {
 		return fmt.Errorf("cannot create nginx log dir: %w", err)
 	}
-	// Pre-create the temp directories (client_body, proxy, fastcgi, uwsgi,
-	// scgi) so nginx never falls back to its compile-time MAMP defaults.
 	if err := ensureNginxTempDirs(); err != nil {
 		return fmt.Errorf("cannot prepare nginx temp dirs: %w", err)
 	}
 
-	accessLog := filepath.Join(logDir, "access.log")
-	errorLog := filepath.Join(logDir, "error.log")
-	pidFile := filepath.Join(logDir, "nginx.pid")
+	accessLog := filepath.ToSlash(filepath.Join(logDir, "access.log"))
+	errorLog := filepath.ToSlash(filepath.Join(logDir, "error.log"))
+	pidFile := filepath.ToSlash(filepath.Join(logDir, "nginx.pid"))
+	docRootSlash := filepath.ToSlash(docRoot)
 
-	// Compute absolute temp paths under ~/.zampp/tmp/nginx/ so they fully
-	// override the MAMP-baked defaults baked into the binary
-	// (/Applications/MAMP/Library/client_body_temp etc.).
 	tmpDirs, err := nginxTempDirs()
 	if err != nil {
 		return err
 	}
-	clientBodyTmp := tmpDirs[0]
-	proxyTmp := tmpDirs[1]
-	fastcgiTmp := tmpDirs[2]
-	uwsgiTmp := tmpDirs[3]
-	scgiTmp := tmpDirs[4]
+	clientBodyTmp := filepath.ToSlash(tmpDirs[0])
+	proxyTmp := filepath.ToSlash(tmpDirs[1])
+	fastcgiTmp := filepath.ToSlash(tmpDirs[2])
+	uwsgiTmp := filepath.ToSlash(tmpDirs[3])
+	scgiTmp := filepath.ToSlash(tmpDirs[4])
 
-	// nginx.conf generator.
-	//
-	// Critical: PHP backend on port 8001 is a FastCGI server (php-cgi -b or
-	// php-fpm) — NOT an HTTP server. The previous config used
-	//     proxy_pass http://127.0.0.1:8001;
-	// which sends an HTTP request to the FastCGI port. PHP immediately closes
-	// the connection (it only speaks the FastCGI binary protocol), nginx logs
-	//
-	//     kevent() ... Connection reset by peer while reading response header
-	//     from upstream, upstream: "http://127.0.0.1:8001/index.php"
-	//
-	// and returns 502 Bad Gateway. The correct directive is `fastcgi_pass`,
-	// which speaks the FastCGI protocol.
-	//
-	// All paths (pid, error_log, access_log, *_temp_path) are absolute under
-	// ~/.zampp/ to override the compile-time MAMP defaults that point at
-	// /Applications/MAMP/... which doesn't exist on end-user machines.
 	conf := "worker_processes  1;\n" +
-		"pid " + pidFile + ";\n" +
-		"error_log " + errorLog + ";\n\n" +
+		"pid \"" + pidFile + "\";\n" +
+		"error_log \"" + errorLog + "\";\n\n" +
 		"events {\n" +
 		"    worker_connections  1024;\n" +
 		"}\n\n" +
 		"http {\n" +
-		// Override compile-time temp paths so nginx never tries to mkdir
-		// under /Applications/MAMP/Library/... (which fails with ENOENT).
-		"    client_body_temp_path " + clientBodyTmp + ";\n" +
-		"    proxy_temp_path       " + proxyTmp + ";\n" +
-		"    fastcgi_temp_path     " + fastcgiTmp + ";\n" +
-		"    uwsgi_temp_path       " + uwsgiTmp + ";\n" +
-		"    scgi_temp_path        " + scgiTmp + ";\n\n" +
-		"    access_log  " + accessLog + ";\n" +
-		"    error_log   " + errorLog + ";\n\n" +
+		"    client_body_temp_path \"" + clientBodyTmp + "\";\n" +
+		"    proxy_temp_path       \"" + proxyTmp + "\";\n" +
+		"    fastcgi_temp_path     \"" + fastcgiTmp + "\";\n" +
+		"    uwsgi_temp_path       \"" + uwsgiTmp + "\";\n" +
+		"    scgi_temp_path        \"" + scgiTmp + "\";\n\n" +
+		"    access_log  \"" + accessLog + "\";\n" +
+		"    error_log   \"" + errorLog + "\";\n\n" +
 		"    server {\n" +
 		"        listen       " + nginxPort + ";\n" +
 		"        server_name  localhost;\n\n" +
-		"        root   " + docRoot + ";\n" +
+		"        root   \"" + docRootSlash + "\";\n" +
 		"        index  index.php index.html index.htm;\n\n" +
 		"        location / {\n" +
 		"            try_files $uri $uri/ =404;\n" +
 		"        }\n\n" +
-		// Hand off .php to the FastCGI worker on 8001. SCRIPT_FILENAME is
-		// constructed from $document_root + $fastcgi_script_name and is the
-		// absolute path PHP needs (resolves 'No input file specified.').
 		"        location ~ \\.php$ {\n" +
 		"            fastcgi_pass   127.0.0.1:" + phpInternalPort + ";\n" +
 		"            fastcgi_index  index.php;\n" +
@@ -1280,12 +1289,6 @@ func GenerateNginxConfig() error {
 		return fmt.Errorf("cannot write nginx.conf: %w", err)
 	}
 
-	// Write a minimal fastcgi_params file next to nginx.conf. The official
-	// nginx build ships this under conf/fastcgi_params, but the ZAMPP nginx
-	// binary distribution only contains the `nginx` executable (no conf/
-	// directory). Without this file, `include fastcgi_params;` would
-	// fail with `open() .../fastcgi_params failed (2: No such file or
-	// directory)` and nginx -t would report config test is failed.
 	fcgiParamsPath := filepath.Join(filepath.Dir(confPath), "fastcgi_params")
 	if err := os.WriteFile(fcgiParamsPath, []byte(fastcgiParamsContent), 0644); err != nil {
 		return fmt.Errorf("cannot write fastcgi_params: %w", err)
@@ -1294,12 +1297,7 @@ func GenerateNginxConfig() error {
 	return nil
 }
 
-// fastcgiParamsContent is the standard set of FastCGI variables nginx passes
-// to PHP. Mirrors the upstream conf/fastcgi_params file shipped with nginx.
-// SCRIPT_FILENAME is intentionally NOT included here — it is set explicitly
-// in the location ~ \.php$ block in the generated nginx.conf so we have full
-// control over its form ($document_root + $fastcgi_script_name, the canonical
-// mapping for php-cgi/php-fpm).
+// fastcgiParamsContent is the standard set of FastCGI variables nginx passes to PHP.
 const fastcgiParamsContent = `fastcgi_param  QUERY_STRING       $query_string;
 fastcgi_param  REQUEST_METHOD     $request_method;
 fastcgi_param  CONTENT_TYPE       $content_type;
@@ -1328,8 +1326,7 @@ fastcgi_param  REDIRECT_STATUS    200;
 // StartNginx starts the standalone nginx server using the generated conf.
 func (a *App) StartNginx() string {
 	if nginxProcess != nil && nginxProcess.Process != nil {
-		// Check if the process is still alive.
-		if err := nginxProcess.Process.Signal(os.Signal(nil)); err == nil {
+		if isProcessAlive(nginxProcess) {
 			return "Info: Nginx is already running"
 		}
 	}
@@ -1341,7 +1338,7 @@ func (a *App) StartNginx() string {
 
 	// Check that the binary file is present.
 	if _, err := os.Stat(binaryPath); err != nil {
-		return "Nginx Not Installed — letakkan binary di ~/.zampp/bin/nginx/nginx"
+		return "Nginx Not Installed — letakkan binary di ~/.zampp/bin/nginx/nginx.exe"
 	}
 
 	// Ensure it is executable.
@@ -1362,39 +1359,19 @@ func (a *App) StartNginx() string {
 	// Defensive cleanup of any stale nginx on our port.
 	a.stopNginxOnPort()
 
-	// Use `-p <prefix>` to override the compile-time prefix baked into the
-	// nginx binary (for ZAMPP that's /Applications/MAMP/Library/... which
-	// doesn't exist on end-user machines and causes errors like
-	//   open() "/Applications/MAMP/logs/nginx_error.log" failed
-	//   mkdir() "/Applications/MAMP/Library/client_body_temp" failed
-	// `-p ~/.zampp/` makes nginx resolve every relative path (include
-	// fastcgi_params, etc.) against the ZAMPP prefix instead. Combined with
-	// the absolute paths in *_temp_path/error_log/pid directives above, this
-	// supports the MAMP-baked defaults so the binary is portable.
 	appRoot, err := appRootDir()
 	if err != nil {
 		return err.Error()
 	}
-	// Pass error_log via `-g` so it takes effect as early as possible. nginx
-	// 1.19.2 still emits a single pre-config "alert" line to its compile-
-	// time default error_log path (/Applications/MAMP/...) before reading
-	// the `-g` directives, but crucially the /Applications/MAMP directory
-	// is NOT created when the `-g` error_log is in place — nginx fails to
-	// open the default path, logs one alert, then switches to our `-g`
-	// path. Without `-g`, /Applications/MAMP/ gets created by nginx trying
-	// to mkdir-and-open the default path on every start.
-	//
-	// `pid` is intentionally NOT in `-g` — it would duplicate the pid
-	// directive already in nginx.conf, which nginx treats as an emerg-level
-	// "duplicate directive" error.
+
 	logDir, _ := nginxLogDir()
 	globalDirectives := fmt.Sprintf(
-		"error_log %s; daemon off;",
-		filepath.Join(logDir, "error.log"),
+		"error_log \"%s\"; daemon off;",
+		filepath.ToSlash(filepath.Join(logDir, "error.log")),
 	)
 	cmd := exec.Command(binaryPath,
-		"-p", appRoot+"/",
-		"-c", confPath,
+		"-p", filepath.ToSlash(appRoot)+"/",
+		"-c", filepath.ToSlash(confPath),
 		"-g", globalDirectives,
 	)
 
@@ -1430,14 +1407,7 @@ func (a *App) StartNginx() string {
 	return fmt.Sprintf("Started Nginx on port %s (conf: %s)", nginxPort, confPath)
 }
 
-// StopNginx stops the running nginx process, if any.
-//
-// Safety contract:
-//   - Never targets a process group (no `kill -- -PID`, no PID 0/negative).
-//   - Primary path: kill the tracked *exec.Cmd's process only.
-//   - Fallback A: `nginx -s stop -c <conf>` (nginx's own graceful stop).
-//   - Fallback B: `pkill -f nginx` (matches the nginx command line, no PID).
-//   - Fallback C: per-PID `kill -TERM <pid>` for listeners on nginxPort.
+// StopNginx stops the running nginx process on Windows.
 func (a *App) StopNginx() (result string) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -1447,15 +1417,12 @@ func (a *App) StopNginx() (result string) {
 
 	var messages []string
 
-	// Primary path: kill the tracked process only.
+	// Primary path: kill the tracked process using native Go os.Process.Kill()
 	if nginxProcess != nil && nginxProcess.Process != nil {
 		pid := nginxProcess.Process.Pid
 		if pid > 0 {
-			// SIGTERM for graceful shutdown (nginx handles it cleanly).
-			if err := nginxProcess.Process.Signal(syscall.SIGTERM); err != nil {
-				_ = nginxProcess.Process.Kill()
-			}
-			// Reap zombie in background.
+			_ = nginxProcess.Process.Kill()
+			_ = killProcessByPID(pid)
 			go func(c *exec.Cmd) {
 				if c != nil {
 					_ = c.Wait()
@@ -1466,16 +1433,14 @@ func (a *App) StopNginx() (result string) {
 		nginxProcess = nil
 	}
 
-	// Fallback A: nginx's own graceful stop, using the generated conf.
+	// Fallback A: nginx's own graceful stop, using the generated conf
 	if confPath, err := nginxConfPath(); err == nil {
 		if binaryPath, err := nginxBinaryPath(); err == nil {
 			_ = exec.Command(binaryPath, "-s", "stop", "-c", confPath).Run()
 		}
 	}
 
-	// Fallback B: kill the exact PID listening on nginxPort (defensive).
-	// We do NOT run `pkill -f nginx` — that would kill every nginx on the
-	// system (Homebrew, MAMP, etc).
+	// Fallback B: kill any PID listening on nginxPort
 	msgs := a.stopNginxOnPort()
 	if msgs != "" && !strings.HasPrefix(msgs, "Info:") {
 		messages = append(messages, msgs)
@@ -1487,25 +1452,15 @@ func (a *App) StopNginx() (result string) {
 	return strings.Join(messages, "; ")
 }
 
-// stopNginxOnPort kills any process listening on the nginx port. Used as a
-// last-resort cleanup. It never uses process-group kills.
+// stopNginxOnPort kills any process listening on the nginx port on Windows.
 func (a *App) stopNginxOnPort() string {
-	out, err := exec.Command("lsof", "-ti", "tcp:"+nginxPort, "-sTCP:LISTEN").Output()
-	if err != nil {
-		return "Info: no Nginx process found on port " + nginxPort + " (already stopped)"
-	}
-	pids := strings.TrimSpace(string(out))
-	if pids == "" {
+	pids := getPIDsOnPort(nginxPort)
+	if len(pids) == 0 {
 		return "Info: no Nginx process found on port " + nginxPort + " (already stopped)"
 	}
 	var messages []string
-	for _, pid := range strings.Split(pids, "\n") {
-		pid = strings.TrimSpace(pid)
-		// Safety: never kill PID 0 or negative values.
-		if pid == "" || pid == "0" || strings.HasPrefix(pid, "-") {
-			continue
-		}
-		if err := exec.Command("kill", "-TERM", pid).Run(); err != nil {
+	for _, pid := range pids {
+		if err := killPIDString(pid); err != nil {
 			messages = append(messages, fmt.Sprintf("failed to kill PID %s: %s", pid, err.Error()))
 		} else {
 			messages = append(messages, fmt.Sprintf("stopped PID %s", pid))
@@ -1528,13 +1483,24 @@ func apacheBaseDir() (string, error) {
 }
 
 // apacheBinaryPath returns the absolute path to the httpd binary
-// (e.g. ~/.zampp/bin/apache/httpd).
+// (e.g. ~/.zampp/bin/apache/bin/httpd.exe).
 func apacheBinaryPath() (string, error) {
 	base, err := apacheBaseDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(base, "httpd"), nil
+	candidates := []string{
+		filepath.Join(base, "bin", "httpd.exe"),
+		filepath.Join(base, "httpd.exe"),
+		filepath.Join(base, "bin", "httpd"),
+		filepath.Join(base, "httpd"),
+	}
+	for _, p := range candidates {
+		if info, err := os.Stat(p); err == nil && !info.IsDir() {
+			return p, nil
+		}
+	}
+	return filepath.Join(base, "bin", "httpd.exe"), nil
 }
 
 // apacheConfDir returns the absolute path to the Apache config directory
@@ -1584,26 +1550,17 @@ func (a *App) IsApacheInstalled() bool {
 	return isApacheInstalled()
 }
 
-// portListenerExists returns true if any process is listening on the
-// given TCP port. Used to verify that a daemonized web server (nginx or
-// httpd) is actually running, since the *exec.Cmd tracker points to the
-// parent process which exits immediately after forking the worker.
+// portListenerExists returns true if any process is listening on the given TCP port.
 func portListenerExists(port string) bool {
-	out, err := exec.Command("lsof", "-ti", "tcp:"+port, "-sTCP:LISTEN").Output()
-	if err != nil {
-		return false
+	conn, err := net.DialTimeout("tcp", "127.0.0.1:"+port, 200*time.Millisecond)
+	if err == nil {
+		conn.Close()
+		return true
 	}
-	return strings.TrimSpace(string(out)) != ""
+	return len(getPIDsOnPort(port)) > 0
 }
 
-// waitForPort polls lsof for a TCP listener on the given port up to the
-// specified timeout. Returns true once the port is listening, false if the
-// deadline elapses first. The poll interval is 100ms.
-//
-// This is used by StartApache/StartNginx to detect startup failures where
-// exec() succeeds (cmd.Start() returns nil) but the process crashes within
-// milliseconds (e.g. dynamic loader errors, missing modules, port in use).
-// Without this check, the frontend would believe the server is up.
+// waitForPort polls for a TCP listener on the given port up to the specified timeout.
 func waitForPort(port string, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -1667,14 +1624,10 @@ func ensureAdminerDownloaded() error {
 	return nil
 }
 
-// OpenAdminer opens Adminer in the user's default browser via the macOS
-// `open` command. It routes the URL through whichever web server is currently
-// running (preferring Nginx :8000, falling back to Apache :8000), and prefills
-// the MySQL server field to 127.0.0.1:<mySQLPort> so login works against the
-// app's standalone MySQL on port 3307 (not XAMPP's 3306).
-//
-// On-Demand: if ~/.zampp/htdocs/adminer.php does not exist yet, it is
-// downloaded from the official Adminer GitHub release before opening.
+// OpenAdminer opens Adminer in the user's default browser on Windows.
+// It routes the URL through whichever web server is currently running
+// (Nginx :9000 or Apache :9000), and prefills the MySQL server field to
+// 127.0.0.1:3309 so login works against the app's standalone MySQL on port 3309.
 func (a *App) OpenAdminer() string {
 	// 1) Ensure Adminer is present in htdocs (download on-demand).
 	if err := ensureAdminerDownloaded(); err != nil {
@@ -1683,57 +1636,42 @@ func (a *App) OpenAdminer() string {
 
 	// 2) Resolve the running web server's base URL.
 	var baseURL string
-	if nginxProcess != nil && nginxProcess.Process != nil {
-		if err := nginxProcess.Process.Signal(os.Signal(nil)); err == nil {
-			baseURL = "http://127.0.0.1:" + nginxPort
-		}
-	}
-	// Nginx/httpd daemonize: the tracked parent exits after forking the
-	// worker, so the process tracker can be stale. Fall back to checking
-	// whether anything is actually listening on the ports.
-	if baseURL == "" && portListenerExists(nginxPort) {
+	if isProcessAlive(nginxProcess) || portListenerExists(nginxPort) {
 		baseURL = "http://127.0.0.1:" + nginxPort
-	}
-	if baseURL == "" && apacheProcess != nil && apacheProcess.Process != nil {
-		if err := apacheProcess.Process.Signal(os.Signal(nil)); err == nil {
-			baseURL = "http://127.0.0.1:" + apachePort
-		}
-	}
-	if baseURL == "" && portListenerExists(apachePort) {
+	} else if isProcessAlive(apacheProcess) || portListenerExists(apachePort) {
 		baseURL = "http://127.0.0.1:" + apachePort
 	}
 	if baseURL == "" {
 		return "Error: jalankan Nginx atau Apache terlebih dahulu"
 	}
 
-	// 3) Build Adminer URL with prefilled MySQL server (127.0.0.1:3307) and
-	//    username=root so the user only needs the password.
+	// 3) Build Adminer URL with prefilled MySQL server (127.0.0.1:3309) and username=root.
 	url := baseURL + "/adminer.php?server=127.0.0.1:" + mySQLPort + "&username=root&password=root"
 
-	if err := exec.Command("open", url).Start(); err != nil {
-		return fmt.Sprintf("Error: gagal membuka browser: %s", err.Error())
+	if err := exec.Command("cmd", "/c", "start", url).Start(); err != nil {
+		if err2 := exec.Command("explorer", url).Start(); err2 != nil {
+			return fmt.Sprintf("Error: gagal membuka browser: %s", err.Error())
+		}
 	}
 	return "Opened Adminer at " + url
 }
 
-// OpenWebRoot opens the running web server's root URL (http://127.0.0.1:8000)
-// in the user's default browser via the macOS `open` command. The WebView's
-// window.open does not reliably launch an external browser on macOS, so we
-// shell out to `open` instead.
+// OpenWebRoot opens the running web server's root URL (http://127.0.0.1:9000)
+// in the user's default browser on Windows.
 func (a *App) OpenWebRoot() string {
-	if !portListenerExists(nginxPort) {
+	if !portListenerExists(nginxPort) && !portListenerExists(apachePort) {
 		return "Error: jalankan Web Server terlebih dahulu"
 	}
 	url := "http://127.0.0.1:" + nginxPort
-	if err := exec.Command("open", url).Start(); err != nil {
-		return fmt.Sprintf("Error: gagal membuka browser: %s", err.Error())
+	if err := exec.Command("cmd", "/c", "start", url).Start(); err != nil {
+		if err2 := exec.Command("explorer", url).Start(); err2 != nil {
+			return fmt.Sprintf("Error: gagal membuka browser: %s", err.Error())
+		}
 	}
 	return "Opened WebRoot at " + url
 }
 
-// OpenHtdocsFolder opens the ~/.zampp/htdocs directory in Finder
-// via the macOS `open` command. Useful because the folder is hidden under
-// the user's home directory and inconvenient to navigate to manually.
+// OpenHtdocsFolder opens the ~/.zampp/htdocs directory in Windows File Explorer.
 func (a *App) OpenHtdocsFolder() error {
 	docRoot, err := htdocsPath()
 	if err != nil {
@@ -1742,8 +1680,8 @@ func (a *App) OpenHtdocsFolder() error {
 	if err := os.MkdirAll(docRoot, 0755); err != nil {
 		return fmt.Errorf("cannot create htdocs at %s: %w", docRoot, err)
 	}
-	if err := exec.Command("open", docRoot).Run(); err != nil {
-		return fmt.Errorf("failed to open Finder: %w", err)
+	if err := exec.Command("explorer", docRoot).Start(); err != nil {
+		return fmt.Errorf("failed to open Explorer: %w", err)
 	}
 	return nil
 }
@@ -1799,118 +1737,60 @@ func ensureComposerDownloaded() error {
 	}
 	out.Close()
 
-	// Make it executable (chmod +x) so it can be invoked directly if needed.
 	if err := os.Chmod(target, 0755); err != nil {
 		return fmt.Errorf("cannot chmod %s: %w", target, err)
 	}
 	return nil
 }
 
-// OpenTerminal opens a macOS terminal (iTerm2 if installed, otherwise the
-// built-in Terminal.app) pre-configured for ZAMPP. The activePhpVersion
-// (e.g. "8.2") is injected into the shell PATH so the user gets that exact
-// PHP binary, and a `composer` alias is created that runs the downloaded
-// composer.phar with that PHP. The terminal starts in ~/.zampp/htdocs.
-//
-// On-Demand: if ~/.zampp/bin/composer.phar does not exist yet, it is
-// downloaded from getcomposer.org before opening the terminal.
-//
-// The terminal session is scoped (no global PATH mutation) — only this shell
-// session sees the ZAMPP php/composer overrides.
+// OpenTerminal opens a new Windows PowerShell terminal pre-configured for ZAMPP.
+// The active PHP directory is temporarily prepended to PATH so that php.exe is immediately
+// available in the session, and a composer helper function is defined to execute composer.phar.
 func (a *App) OpenTerminal(activePhpVersion string) error {
 	version := strings.TrimSpace(activePhpVersion)
 	if version == "" {
 		return fmt.Errorf("activePhpVersion is empty")
 	}
 
-	// 1) Ensure composer.phar is present (download on-demand).
 	if err := ensureComposerDownloaded(); err != nil {
 		return err
 	}
 
-	// 2) Detect the active PHP version's folder layout:
-	//    - static-php-cli (SPC): binary at ~/.zampp/bin/php/{version}/php
-	//      → add the version dir itself to PATH.
-	//    - MAMP layout:          binary at ~/.zampp/bin/php/{version}/bin/php
-	//      → add the /bin subdir to PATH.
-	//    This makes the exported PATH match whichever bundle was downloaded,
-	//    so `php` in the terminal resolves to the correct binary.
-	home, err := os.UserHomeDir()
+	home, err := homeDir()
 	if err != nil {
 		return fmt.Errorf("cannot resolve home dir: %w", err)
 	}
 	phpBase := filepath.Join(home, appDirName, "bin", "php", version)
-	phpExecutablePath := phpBase // default: static-php-cli layout
-	if _, err := os.Stat(filepath.Join(phpBase, "bin", "php")); err == nil {
-		// MAMP layout: php binary lives under /bin
+	phpExecutablePath := phpBase
+	if _, err := os.Stat(filepath.Join(phpBase, "bin", "php.exe")); err == nil {
 		phpExecutablePath = filepath.Join(phpBase, "bin")
+	} else if _, err := os.Stat(filepath.Join(phpBase, "php.exe")); err == nil {
+		phpExecutablePath = phpBase
 	}
 
-	// 3) Build the shell command string that will be executed in the
-	//    terminal session. It exports the detected php folder to the front
-	//    of PATH, aliases `composer` to use that PHP with the downloaded
-	//    composer.phar, cd's into htdocs, prints a banner, and runs
-	//    `php -v`.
-	//
-	//    Note: we escape the shell-side double-quotes as \", because the
-	//    string will be embedded inside an AppleScript string literal that
-	//    is itself wrapped in double-quotes — without escaping, the
-	//    embedded " would prematurely close the AppleScript string and
-	//    cause an osascript exit status 1.
-	cmdString := fmt.Sprintf(`export PATH=\"%s:$PATH\"; alias composer='php $HOME/.zampp/bin/composer.phar'; cd $HOME/.zampp/htdocs; clear; echo '⚡️ ZAMPP Smart Terminal Ready!'; echo 'Active PHP: %s'; echo 'Composer is ready to use. Type ''composer'' to test.'; echo ''; php -v`, phpExecutablePath, version)
-
-	// 4) Detect iTerm2 — if installed, prefer it over Terminal.app (most
-	//    developers use iTerm2). Falls back to the built-in Terminal
-	//    otherwise.
-	var script string
-	if _, err := os.Stat("/Applications/iTerm.app"); err == nil {
-		// iTerm2: if no window is open, create a new window; otherwise
-		// create a tab in the current window. This handles both the
-		// "iTerm not running" and "iTerm already open" cases reliably
-		// (the previous try/on error was fragile when iTerm was active).
-		script = fmt.Sprintf(`
-tell application "iTerm"
-    activate
-    if (count of windows) = 0 then
-        set newWindow to (create window with default profile)
-        tell current session of newWindow
-            write text "%s"
-        end tell
-    else
-        tell current window
-            create tab with default profile
-            tell current session
-                write text "%s"
-            end tell
-        end tell
-    end if
-end tell
-`, cmdString, cmdString)
-	} else {
-		// Fallback: built-in Terminal.app.
-		script = fmt.Sprintf(`
-tell application "Terminal"
-    activate
-    do script "%s"
-end tell
-`, cmdString)
+	docRoot, err := htdocsPath()
+	if err != nil {
+		return err
 	}
+	composerPath := filepath.Join(home, appDirName, "bin", "composer.phar")
 
-	// 5) Execute the AppleScript via osascript. The script is piped through
-	//    stdin with "-" as the script argument, which is more reliable than
-	//    passing a multi-line script via "-e <string>" — the latter can fail
-	//    with exit status 1 when the embedded shell command contains quotes
-	//    or newlines that confuse osascript's argv parser.
-	cmd := exec.Command("osascript", "-")
-	cmd.Stdin = strings.NewReader(script)
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to open terminal: %w", err)
+	psInit := fmt.Sprintf(
+		`$env:Path = '%s;' + $env:Path; function composer { php '%s' @args }; Set-Location '%s'; Clear-Host; Write-Host '⚡️ ZAMPP Smart Terminal Ready!' -ForegroundColor Cyan; Write-Host 'Active PHP: %s' -ForegroundColor Green; Write-Host 'Composer is ready to use. Type composer to test.' -ForegroundColor Yellow; php -v`,
+		phpExecutablePath,
+		composerPath,
+		docRoot,
+		version,
+	)
+
+	cmd := exec.Command("cmd", "/c", "start", "powershell", "-NoExit", "-Command", psInit)
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to open PowerShell: %w", err)
 	}
 	return nil
 }
 
-// StartWebServer starts the PHP built-in server (internal port 8001) and then
-// the chosen web server engine (nginx or apache) on port 8000. The UI calls
+// StartWebServer starts the PHP built-in server (internal port 9001) and then
+// the chosen web server engine (nginx or apache) on port 9000. The UI calls
 // this single API so it only needs one Start button + an engine dropdown.
 //
 // engine is "nginx" or "apache". phpVersion is the folder name under
@@ -2084,9 +1964,10 @@ func GenerateApacheConfig() error {
 	if err := os.MkdirAll(logDir, 0755); err != nil {
 		return fmt.Errorf("cannot create apache log dir: %w", err)
 	}
-	pidFile := filepath.Join(logDir, "httpd.pid")
-
-	serverRoot := filepath.Join(appRoot, "bin", "apache")
+	pidFile := filepath.ToSlash(filepath.Join(logDir, "httpd.pid"))
+	errorLog := filepath.ToSlash(filepath.Join(logDir, "error.log"))
+	serverRoot := filepath.ToSlash(filepath.Join(appRoot, "bin", "apache"))
+	absoluteHtdocsPath := filepath.ToSlash(docRoot)
 
 	var b strings.Builder
 	// --- Global directives (must be OUTSIDE <VirtualHost>) ---
@@ -2101,42 +1982,12 @@ func GenerateApacheConfig() error {
 	b.WriteString("LoadModule proxy_fcgi_module modules/mod_proxy_fcgi.so\n\n")
 	b.WriteString("ServerName localhost\n")
 	b.WriteString("PidFile \"" + pidFile + "\"\n")
-	b.WriteString("ErrorLog \"" + filepath.Join(logDir, "error.log") + "\"\n")
+	b.WriteString("ErrorLog \"" + errorLog + "\"\n")
 	b.WriteString("LogLevel warn\n")
 	b.WriteString("ProxyTimeout 60\n\n")
-	// AbsoluteHtdocsPath: Apache does not understand `~`, so we feed it the
-	// fully-resolved absolute path returned by os.UserHomeDir() (already
-	// absolute, e.g. /Users/jamal/.zampp/htdocs). The same value is reused
-	// for DocumentRoot, the Directory block, and the fcgi:// URL prefix.
-	absoluteHtdocsPath := docRoot
 
-	// --- VirtualHost: contains all per-site rules per the requested template ---
 	b.WriteString("<VirtualHost *:" + apachePort + ">\n")
 	b.WriteString("    DocumentRoot \"" + absoluteHtdocsPath + "\"\n\n")
-	// Route .php requests to the FastCGI worker (php-cgi/php-fpm) on 8001.
-	//
-	// Why SetHandler + ProxyFCGISetEnvIf and not ProxyPassMatch:
-	//
-	// 1) The classic pattern that works reliably for php-cgi (which is more
-	//    picky than php-fpm about SCRIPT_FILENAME) on Apache 2.4.10+ is:
-	//
-	//       <FilesMatch \.php$>
-	//           SetHandler "proxy:fcgi://127.0.0.1:8001"
-	//       </FilesMatch>
-	//       ProxyFCGISetEnvIf "true" SCRIPT_FILENAME "%{reqenv:DOCUMENT_ROOT}%{reqenv:SCRIPT_NAME}"
-	//
-	//    mod_proxy_fcgi doesn't always derive SCRIPT_FILENAME the way
-	//    php-cgi expects (it sets SCRIPT_NAME / PATH_INFO but leaves
-	//    SCRIPT_FILENAME pointing at the URL rather than the mapped
-	//    filesystem path). The explicit ProxyFCGISetEnvIf rewrites it to
-	//    DOCUMENT_ROOT + SCRIPT_NAME — the canonical, valid value.
-	//
-	// 2) We previously tried ProxyPassMatch "fcgi://host:port{absRoot}/$1"
-	//    and a trailing-slash-less SetHandler. Both still produced
-	//    'No input file specified.' on Apache 2.4.54 + php-cgi.
-	//
-	// 3) The bare fcgi SetHandler sets the handler so Apache knows to proxy
-	//    to FastCGI; ProxyFCGISetEnvIf adjusts the env passed via FastCGI.
 	b.WriteString("    ProxyFCGISetEnvIf \"true\" SCRIPT_FILENAME \"%{reqenv:DOCUMENT_ROOT}%{reqenv:SCRIPT_NAME}\"\n")
 	b.WriteString("    <FilesMatch \\.php$>\n")
 	b.WriteString("        SetHandler \"proxy:fcgi://127.0.0.1:" + phpInternalPort + "\"\n")
@@ -2163,8 +2014,7 @@ func GenerateApacheConfig() error {
 // StartApache starts the standalone httpd server using the generated conf.
 func (a *App) StartApache() string {
 	if apacheProcess != nil && apacheProcess.Process != nil {
-		// Check if the process is still alive.
-		if err := apacheProcess.Process.Signal(os.Signal(nil)); err == nil {
+		if isProcessAlive(apacheProcess) {
 			return "Info: Apache is already running"
 		}
 	}
@@ -2176,7 +2026,7 @@ func (a *App) StartApache() string {
 
 	// Check that the binary file is present.
 	if _, err := os.Stat(binaryPath); err != nil {
-		return "Apache Not Installed — letakkan binary di ~/.zampp/bin/apache/httpd"
+		return "Apache Not Installed — letakkan binary di ~/.zampp/bin/apache/bin/httpd.exe"
 	}
 
 	// Ensure it is executable.
@@ -2197,24 +2047,9 @@ func (a *App) StartApache() string {
 	// Defensive cleanup of any stale httpd on our port.
 	a.stopApacheOnPort()
 
-	// -X is Apache's "debug mode" flag: single worker, does NOT detach from
-	// the controlling terminal. This is what we actually want — without -X,
-	// httpd daemonizes (parent forks workers and exits immediately), which
-	// left us with no live process handle and caused the Stop button to
-	// force-close the app via SIGCHLD/SIGHUP race. With -X, the httpd parent
-	// stays as a direct child of this Go process and StopApache can reliably
-	// signal + Wait for it.
-	//
-	// Note: Apache does NOT have a -DFOREGROUND define (common misconception).
-	// The `-D name` flag only defines names for <IfDefine name> blocks in the
-	// config; it does not change the daemonize behavior of MPM prefork.
-	cmd := exec.Command(binaryPath, "-X", "-f", confPath)
+	cmd := exec.Command(binaryPath, "-X", "-f", filepath.ToSlash(confPath))
 
-	// Stream stdout/stderr to log file + parent terminal so httpd startup
-	// errors (dyld "Library not loaded", missing modules, bind failures)
-	// are visible in `wails dev` and in ~/.zampp/logs/apache/stdout.log.
-	// extraStderr captures the first chunk of startup errors so we can
-	// report them synchronously after a port-timeout below.
+	// Stream stdout/stderr to log file + parent terminal
 	apacheLogDir, _ := apacheLogDir()
 	stderrBuffer := newSafeBuffer()
 	attachLogger(cmd, apacheLogDir, "stdout.log", stderrBuffer)
@@ -2224,17 +2059,9 @@ func (a *App) StartApache() string {
 	}
 
 	apacheProcess = cmd
-	// Do NOT call Process.Release() — with -DFOREGROUND the httpd parent
-	// stays alive as our child and we want a live handle for StopApache
-	// (Signal/Kill) + cmd.Wait() (reap zombie).
 
-	// Wait briefly for the port to come up. httpd usually listens within a few
-	// hundred ms; if the process crashed on startup (loader errors, port in
-	// use, module load failure), the port check will stay false and we report
-	// the stderr we captured instead of a misleading "Started Apache".
 	if !waitForPort(apachePort, 3000*time.Millisecond) {
 		stderrText := strings.TrimSpace(stderrBuffer.String())
-		// Best-effort cleanup of any half-spawned process.
 		a.StopApache()
 		if stderrText != "" {
 			return fmt.Sprintf("Error: Apache gagal start (port %s tidak listening): %s", apachePort, stderrText)
@@ -2245,19 +2072,7 @@ func (a *App) StartApache() string {
 	return fmt.Sprintf("Started Apache on port %s (conf: %s)", apachePort, confPath)
 }
 
-// StopApache stops the running httpd process, if any.
-//
-// Safety contract:
-//   - Never targets a process group (no `kill -- -PID`, no PID 0/negative).
-//   - Never runs `pkill -f httpd` — that would kill ALL httpd on the system,
-//     including other applications' Apache (XAMPP, Homebrew, MAMP).
-//   - Primary path: kill the tracked *exec.Cmd's process only.
-//   - Fallback A: `httpd -k stop -f <conf>` (Apache's own graceful stop).
-//   - Fallback B: per-PID `kill -TERM <pid>` for listeners on apachePort.
-//
-// With -DFOREGROUND (used in StartApache), the httpd parent stays alive as a
-// child of this Go process until killed here. We call cmd.Wait() in a
-// goroutine after SIGTERM to reap the zombie.
+// StopApache stops the running httpd process on Windows.
 func (a *App) StopApache() (result string) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -2267,17 +2082,12 @@ func (a *App) StopApache() (result string) {
 
 	var messages []string
 
-	// Primary path: kill the tracked process only.
+	// Primary path: kill the tracked process using native Go os.Process.Kill()
 	if apacheProcess != nil && apacheProcess.Process != nil {
 		pid := apacheProcess.Process.Pid
 		if pid > 0 {
-			// Try graceful SIGTERM first. With -DFOREGROUND, httpd parent
-			// handles SIGTERM and propagates to workers.
-			if err := apacheProcess.Process.Signal(syscall.SIGTERM); err != nil {
-				// Fall back to SIGKILL if SIGTERM fails (process already dead).
-				_ = apacheProcess.Process.Kill()
-			}
-			// Reap zombie in background; do not block the UI.
+			_ = apacheProcess.Process.Kill()
+			_ = killProcessByPID(pid)
 			go func(c *exec.Cmd) {
 				if c != nil {
 					_ = c.Wait()
@@ -2288,14 +2098,14 @@ func (a *App) StopApache() (result string) {
 		apacheProcess = nil
 	}
 
-	// Fallback A: Apache's own graceful stop, using the generated conf.
+	// Fallback A: Apache's own stop, using generated conf
 	if confPath, err := apacheConfPath(); err == nil {
 		if binaryPath, err := apacheBinaryPath(); err == nil {
 			_ = exec.Command(binaryPath, "-k", "stop", "-f", confPath).Run()
 		}
 	}
 
-	// Fallback B: kill the exact PID listening on apachePort (defensive).
+	// Fallback B: kill any PID listening on apachePort
 	msgs := a.stopApacheOnPort()
 	if msgs != "" && !strings.HasPrefix(msgs, "Info:") {
 		messages = append(messages, msgs)
@@ -2307,25 +2117,15 @@ func (a *App) StopApache() (result string) {
 	return strings.Join(messages, "; ")
 }
 
-// stopApacheOnPort kills any process listening on the apache port. Used as a
-// last-resort cleanup. It never uses process-group kills.
+// stopApacheOnPort kills any process listening on the apache port on Windows.
 func (a *App) stopApacheOnPort() string {
-	out, err := exec.Command("lsof", "-ti", "tcp:"+apachePort, "-sTCP:LISTEN").Output()
-	if err != nil {
-		return "Info: no Apache process found on port " + apachePort + " (already stopped)"
-	}
-	pids := strings.TrimSpace(string(out))
-	if pids == "" {
+	pids := getPIDsOnPort(apachePort)
+	if len(pids) == 0 {
 		return "Info: no Apache process found on port " + apachePort + " (already stopped)"
 	}
 	var messages []string
-	for _, pid := range strings.Split(pids, "\n") {
-		pid = strings.TrimSpace(pid)
-		// Safety: never kill PID 0 or negative values.
-		if pid == "" || pid == "0" || strings.HasPrefix(pid, "-") {
-			continue
-		}
-		if err := exec.Command("kill", "-TERM", pid).Run(); err != nil {
+	for _, pid := range pids {
+		if err := killPIDString(pid); err != nil {
 			messages = append(messages, fmt.Sprintf("failed to kill PID %s: %s", pid, err.Error()))
 		} else {
 			messages = append(messages, fmt.Sprintf("stopped PID %s", pid))
@@ -2339,14 +2139,13 @@ func (a *App) stopApacheOnPort() string {
 // It uses:
 //
 //	--datadir=~/.zampp/data/mysql
-//	--port=3307  (avoids clashing with XAMPP on 3306)
+//	--port=3309  (avoids clashing with XAMPP on 3306)
 //	--socket=~/.zampp/data/mysql/mysql.sock  (avoids /tmp/mysql.sock)
 //
 // The process reference is stored in the package-level mysqlProcess variable.
 func (a *App) StartMySQL() string {
 	if mysqlProcess != nil && mysqlProcess.Process != nil {
-		// Check if the process is still alive by sending signal 0.
-		if err := mysqlProcess.Process.Signal(os.Signal(nil)); err == nil {
+		if isProcessAlive(mysqlProcess) {
 			return "Info: MySQL is already running"
 		}
 	}
@@ -2544,23 +2343,28 @@ func forceRootPasswordViaGrantTables() error {
 	return nil
 }
 
-// mysqlClientPath returns the absolute path to the mysqladmin client binary
-// (e.g. ~/.zampp/bin/mysql/bin/mysqladmin).
+// mysqlClientPath returns the absolute path to the mysql client binary
+// (e.g. ~/.zampp/bin/mysql/bin/mysql.exe).
 func mysqlClientPath() (string, error) {
 	base, err := mysqlBaseDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(base, "bin", "mysqladmin"), nil
+	candidates := []string{
+		filepath.Join(base, "bin", "mysql.exe"),
+		filepath.Join(base, "bin", "mysqladmin.exe"),
+		filepath.Join(base, "bin", "mysql"),
+		filepath.Join(base, "bin", "mysqladmin"),
+	}
+	for _, p := range candidates {
+		if info, err := os.Stat(p); err == nil && !info.IsDir() {
+			return p, nil
+		}
+	}
+	return filepath.Join(base, "bin", "mysql.exe"), nil
 }
 
-// StopMySQL stops the running MySQL process, if any.
-//
-// Safety contract:
-//   - Never targets a process group (no `kill -- -PID`, no PID 0/negative).
-//   - Primary path: kill the tracked *exec.Cmd's process only.
-//   - Fallback A: per-PID `kill -TERM <pid>` for the tracked process.
-//   - Fallback B: per-PID `kill -TERM <pid>` for listeners on mySQLPort.
+// StopMySQL stops the running MySQL process on Windows.
 func (a *App) StopMySQL() (result string) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -2570,31 +2374,23 @@ func (a *App) StopMySQL() (result string) {
 
 	var messages []string
 
-	// Primary path: kill the tracked process only.
+	// Primary path: kill the tracked process using native Go os.Process.Kill()
 	if mysqlProcess != nil && mysqlProcess.Process != nil {
 		pid := mysqlProcess.Process.Pid
 		if pid > 0 {
-			if err := mysqlProcess.Process.Signal(syscall.SIGTERM); err != nil {
-				// Per-PID fallback (NOT a process-group kill).
-				if err2 := exec.Command("kill", "-TERM", fmt.Sprintf("%d", pid)).Run(); err2 != nil {
-					messages = append(messages, fmt.Sprintf("failed to stop MySQL (PID %d): %s", pid, err.Error()))
-				} else {
-					messages = append(messages, fmt.Sprintf("stopped MySQL (PID %d)", pid))
-				}
-			} else {
-				messages = append(messages, fmt.Sprintf("stopped MySQL (PID %d)", pid))
-			}
-			// Reap zombie in background.
+			_ = mysqlProcess.Process.Kill()
+			_ = killProcessByPID(pid)
 			go func(c *exec.Cmd) {
 				if c != nil {
 					_ = c.Wait()
 				}
 			}(mysqlProcess)
+			messages = append(messages, fmt.Sprintf("stopped MySQL (PID %d)", pid))
 		}
 		mysqlProcess = nil
 	}
 
-	// Fallback: per-PID cleanup of any listener on mySQLPort.
+	// Fallback: cleanup any listener on mySQLPort
 	msgs := a.stopMySQLOnPort()
 	if msgs != "" && !strings.HasPrefix(msgs, "Info:") {
 		messages = append(messages, msgs)
@@ -2606,31 +2402,16 @@ func (a *App) StopMySQL() (result string) {
 	return strings.Join(messages, "; ")
 }
 
-// stopMySQLOnPort searches for any process listening on tcp:3307 (the port
-// reserved for this app's standalone MySQL) and kills it. Used as a defensive
-// cleanup when the tracked process is unknown.
+// stopMySQLOnPort searches for any process listening on tcp:3309 and kills it on Windows.
 func (a *App) stopMySQLOnPort() string {
-	out, err := exec.Command("lsof", "-ti", "tcp:"+mySQLPort, "-sTCP:LISTEN").Output()
-	if err != nil {
-		return "Info: no MySQL process found on port " + mySQLPort + " (already stopped)"
-	}
-
-	pids := strings.TrimSpace(string(out))
-	if pids == "" {
+	pids := getPIDsOnPort(mySQLPort)
+	if len(pids) == 0 {
 		return "Info: no MySQL process found on port " + mySQLPort + " (already stopped)"
 	}
 
 	var messages []string
-	for _, pid := range strings.Split(pids, "\n") {
-		pid = strings.TrimSpace(pid)
-		if pid == "" {
-			continue
-		}
-		// Safety: never kill PID 0 or negative values.
-		if pid == "0" || strings.HasPrefix(pid, "-") {
-			continue
-		}
-		if err := exec.Command("kill", "-TERM", pid).Run(); err != nil {
+	for _, pid := range pids {
+		if err := killPIDString(pid); err != nil {
 			messages = append(messages, fmt.Sprintf("failed to kill PID %s: %s", pid, err.Error()))
 		} else {
 			messages = append(messages, fmt.Sprintf("stopped PID %s", pid))

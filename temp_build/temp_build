@@ -1,0 +1,2 @@
+$env:TMP="C:\Users\abdul\OneDrive\Documents\zampp\temp_build"
+$env:TEMP="C:\Users\abdul\OneDrive\Documents\zampp\temp_build"
