@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
@@ -108,7 +109,9 @@ func isProcessAlive(cmd *exec.Cmd) bool {
 	if cmd == nil || cmd.Process == nil || cmd.Process.Pid <= 0 {
 		return false
 	}
-	out, err := exec.Command("tasklist", "/FI", fmt.Sprintf("PID eq %d", cmd.Process.Pid), "/NH").Output()
+	tasklistCmd := exec.Command("tasklist", "/FI", fmt.Sprintf("PID eq %d", cmd.Process.Pid), "/NH")
+	tasklistCmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	out, err := tasklistCmd.Output()
 	if err != nil {
 		return false
 	}
@@ -117,7 +120,9 @@ func isProcessAlive(cmd *exec.Cmd) bool {
 
 // getPIDsOnPort returns all process IDs currently listening on the given TCP port on Windows via netstat.
 func getPIDsOnPort(port string) []string {
-	out, err := exec.Command("netstat", "-ano", "-p", "tcp").Output()
+	netstatCmd := exec.Command("netstat", "-ano", "-p", "tcp")
+	netstatCmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	out, err := netstatCmd.Output()
 	if err != nil {
 		return nil
 	}
@@ -156,6 +161,7 @@ func killProcessByPID(pid int) error {
 		_ = proc.Kill()
 	}
 	cmd := exec.Command("taskkill", "/F", "/T", "/PID", fmt.Sprintf("%d", pid))
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	_ = cmd.Run()
 	return nil
 }
@@ -173,6 +179,7 @@ func killPIDString(pidStr string) error {
 		}
 	}
 	cmd := exec.Command("taskkill", "/F", "/T", "/PID", pidStr)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	return cmd.Run()
 }
 
@@ -673,17 +680,6 @@ func mysqldPath() (string, error) {
 	return filepath.Join(base, "bin", "mysqld.exe"), nil
 }
 
-// mysqlSocketPath returns the absolute path to the MySQL Unix socket file.
-// It lives inside the data directory to avoid clashing with XAMPP's
-// /tmp/mysql.sock.
-func mysqlSocketPath() (string, error) {
-	dataDir, err := mysqlDataDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dataDir, "mysql.sock"), nil
-}
-
 // isMySQLInstalled reports whether the mysqld binary exists.
 func isMySQLInstalled() bool {
 	p, err := mysqldPath()
@@ -885,6 +881,7 @@ pm.max_spare_servers = 3
 // listening stage. We run the binary with a 1200ms timeout.
 func probeBinaryRuns(binaryPath string, args []string) error {
 	probe := exec.Command(binaryPath, "-v")
+	probe.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	out, err := probe.CombinedOutput()
 	if err != nil {
 		text := strings.TrimSpace(string(out))
@@ -941,6 +938,7 @@ func (a *App) StartPHP(version string) string {
 	}
 
 	cmd := exec.Command(binaryPath, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 
 	// Stream stdout/stderr to log file + parent terminal so PHP startup
 	// errors are not lost. We tee BOTH stdout and stderr into the safeBuffer —
@@ -1374,6 +1372,7 @@ func (a *App) StartNginx() string {
 		"-c", filepath.ToSlash(confPath),
 		"-g", globalDirectives,
 	)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 
 	// Stream stdout/stderr to log file + parent terminal so nginx startup
 	// errors (missing module, bad config) are visible in `wails dev` and in
@@ -1436,7 +1435,9 @@ func (a *App) StopNginx() (result string) {
 	// Fallback A: nginx's own graceful stop, using the generated conf
 	if confPath, err := nginxConfPath(); err == nil {
 		if binaryPath, err := nginxBinaryPath(); err == nil {
-			_ = exec.Command(binaryPath, "-s", "stop", "-c", confPath).Run()
+			stopCmd := exec.Command(binaryPath, "-s", "stop", "-c", confPath)
+			stopCmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+			_ = stopCmd.Run()
 		}
 	}
 
@@ -1648,8 +1649,12 @@ func (a *App) OpenAdminer() string {
 	// 3) Build Adminer URL with prefilled MySQL server (127.0.0.1:3309) and username=root.
 	url := baseURL + "/adminer.php?server=127.0.0.1:" + mySQLPort + "&username=root&password=root"
 
-	if err := exec.Command("cmd", "/c", "start", url).Start(); err != nil {
-		if err2 := exec.Command("explorer", url).Start(); err2 != nil {
+	cmd := exec.Command("cmd", "/c", "start", url)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	if err := cmd.Start(); err != nil {
+		cmd2 := exec.Command("explorer", url)
+		cmd2.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		if err2 := cmd2.Start(); err2 != nil {
 			return fmt.Sprintf("Error: gagal membuka browser: %s", err.Error())
 		}
 	}
@@ -1663,8 +1668,12 @@ func (a *App) OpenWebRoot() string {
 		return "Error: jalankan Web Server terlebih dahulu"
 	}
 	url := "http://127.0.0.1:" + nginxPort
-	if err := exec.Command("cmd", "/c", "start", url).Start(); err != nil {
-		if err2 := exec.Command("explorer", url).Start(); err2 != nil {
+	cmd := exec.Command("cmd", "/c", "start", url)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	if err := cmd.Start(); err != nil {
+		cmd2 := exec.Command("explorer", url)
+		cmd2.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		if err2 := cmd2.Start(); err2 != nil {
 			return fmt.Sprintf("Error: gagal membuka browser: %s", err.Error())
 		}
 	}
@@ -1680,7 +1689,9 @@ func (a *App) OpenHtdocsFolder() error {
 	if err := os.MkdirAll(docRoot, 0755); err != nil {
 		return fmt.Errorf("cannot create htdocs at %s: %w", docRoot, err)
 	}
-	if err := exec.Command("explorer", docRoot).Start(); err != nil {
+	cmd := exec.Command("explorer", docRoot)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("failed to open Explorer: %w", err)
 	}
 	return nil
@@ -1783,6 +1794,7 @@ func (a *App) OpenTerminal(activePhpVersion string) error {
 	)
 
 	cmd := exec.Command("cmd", "/c", "start", "powershell", "-NoExit", "-Command", psInit)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("failed to open PowerShell: %w", err)
 	}
@@ -1973,7 +1985,6 @@ func GenerateApacheConfig() error {
 	// --- Global directives (must be OUTSIDE <VirtualHost>) ---
 	b.WriteString("ServerRoot \"" + serverRoot + "\"\n")
 	b.WriteString("Listen " + apachePort + "\n\n")
-	b.WriteString("LoadModule unixd_module modules/mod_unixd.so\n")
 	b.WriteString("LoadModule authz_core_module modules/mod_authz_core.so\n")
 	b.WriteString("LoadModule dir_module modules/mod_dir.so\n")
 	b.WriteString("LoadModule mime_module modules/mod_mime.so\n")
@@ -1990,7 +2001,7 @@ func GenerateApacheConfig() error {
 	b.WriteString("    DocumentRoot \"" + absoluteHtdocsPath + "\"\n\n")
 	b.WriteString("    ProxyFCGISetEnvIf \"true\" SCRIPT_FILENAME \"%{reqenv:DOCUMENT_ROOT}%{reqenv:SCRIPT_NAME}\"\n")
 	b.WriteString("    <FilesMatch \\.php$>\n")
-	b.WriteString("        SetHandler \"proxy:fcgi://127.0.0.1:" + phpInternalPort + "\"\n")
+	b.WriteString("        SetHandler \"proxy:fcgi://127.0.0.1:" + phpInternalPort + "/\"\n")
 	b.WriteString("    </FilesMatch>\n\n")
 	b.WriteString("    <Directory \"" + absoluteHtdocsPath + "\">\n")
 	b.WriteString("        Options Indexes FollowSymLinks\n")
@@ -2048,6 +2059,7 @@ func (a *App) StartApache() string {
 	a.stopApacheOnPort()
 
 	cmd := exec.Command(binaryPath, "-X", "-f", filepath.ToSlash(confPath))
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 
 	// Stream stdout/stderr to log file + parent terminal
 	apacheLogDir, _ := apacheLogDir()
@@ -2101,7 +2113,9 @@ func (a *App) StopApache() (result string) {
 	// Fallback A: Apache's own stop, using generated conf
 	if confPath, err := apacheConfPath(); err == nil {
 		if binaryPath, err := apacheBinaryPath(); err == nil {
-			_ = exec.Command(binaryPath, "-k", "stop", "-f", confPath).Run()
+			stopCmd := exec.Command(binaryPath, "-k", "stop", "-f", confPath)
+			stopCmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+			_ = stopCmd.Run()
 		}
 	}
 
@@ -2140,7 +2154,6 @@ func (a *App) stopApacheOnPort() string {
 //
 //	--datadir=~/.zampp/data/mysql
 //	--port=3309  (avoids clashing with XAMPP on 3306)
-//	--socket=~/.zampp/data/mysql/mysql.sock  (avoids /tmp/mysql.sock)
 //
 // The process reference is stored in the package-level mysqlProcess variable.
 func (a *App) StartMySQL() string {
@@ -2157,7 +2170,7 @@ func (a *App) StartMySQL() string {
 
 	// Check that the binary file is present.
 	if _, err := os.Stat(binaryPath); err != nil {
-		return "MySQL Not Installed — letakkan binary di ~/.zampp/bin/mysql/bin/mysqld"
+		return "MySQL Not Installed — letakkan binary di ~/.zampp/bin/mysql/bin/mysqld.exe"
 	}
 
 	// Ensure it is executable.
@@ -2173,19 +2186,15 @@ func (a *App) StartMySQL() string {
 		return fmt.Sprintf("Error: cannot create data dir %s: %s", dataDir, err.Error())
 	}
 
-	socketPath, err := mysqlSocketPath()
-	if err != nil {
-		return fmt.Sprintf("Error: %s", err.Error())
-	}
-
 	// Stop any stale mysqld listening on our port (defensive cleanup).
 	a.stopMySQLOnPort()
 
 	cmd := exec.Command(binaryPath,
-		"--datadir="+dataDir,
+		"--datadir="+filepath.Clean(dataDir),
 		"--port="+mySQLPort,
-		"--socket="+socketPath,
 	)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+
 	// Detach stdout/stderr so the process keeps running after the call returns.
 	if err := cmd.Start(); err != nil {
 		return fmt.Sprintf("Error: failed to start mysqld: %s", err.Error())
@@ -2197,30 +2206,15 @@ func (a *App) StartMySQL() string {
 	_ = cmd.Process.Release()
 
 	// Ensure the root account uses username=root / password=root so the
-	// frontend (and Adminer) can log in predictably. This runs the mysql
-	// client against the just-started server via the Unix socket, and is
-	// idempotent — it works on both fresh (no-password) and existing
-	// (password-already-set) data dirs.
-	go ensureMySQLRootCredentials(socketPath)
+	// frontend (and Adminer) can log in predictably.
+	go ensureMySQLRootCredentials()
 
 	return fmt.Sprintf("Started MySQL on port %s (datadir: %s)", mySQLPort, dataDir)
 }
 
-// ensureMySQLRootCredentials guarantees the root MySQL account uses
-// password=root. It is run as a goroutine shortly after mysqld starts.
-//
-// Flow:
-//  1. Wait for the Unix socket to appear (mysqld ready).
-//  2. Try connecting with password=root. If it works, nothing to do.
-//  3. If that fails, try connecting with no password and run
-//     `ALTER USER 'root'@'localhost' IDENTIFIED BY 'root';` — this is the
-//     fresh-data-dir case.
-//  4. If that also fails (root already has a different password), spin up
-//     a temporary mysqld with --skip-grant-tables, set root's password to
-//     'root' via raw SQL on the `mysql` schema, stop it, and let the main
-//     mysqld continue. This guarantees the frontend contract holds even on
-//     a previously-used data dir whose root password was changed.
-func ensureMySQLRootCredentials(socketPath string) {
+// ensureMySQLRootCredentials guarantees the root MySQL account uses password=root.
+// It is run as a goroutine shortly after mysqld starts.
+func ensureMySQLRootCredentials() {
 	mysqlClient, err := mysqlClientPath()
 	if err != nil {
 		fmt.Println("mysql: cannot resolve mysql client path:", err)
@@ -2231,22 +2225,20 @@ func ensureMySQLRootCredentials(socketPath string) {
 		return
 	}
 
-	// 1) Wait briefly for the socket file to appear.
-	for i := 0; i < 50; i++ {
-		if _, err := os.Stat(socketPath); err == nil {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
+	// 1) Wait for the MySQL TCP port to be listening (up to 5s).
+	if !waitForPort(mySQLPort, 5000*time.Millisecond) {
+		fmt.Printf("mysql: port %s never became ready, skipping root password set\n", mySQLPort)
+		return
 	}
 
 	// 2) Try password=root first — if it already works, nothing to do.
-	if tryMySQLCommand(mysqlClient, socketPath, "root", "root", "SELECT 1") {
+	if tryMySQLCommand(mysqlClient, mySQLPort, "root", "root", "SELECT 1") {
 		fmt.Println("mysql: root password already 'root' — nothing to do")
 		return
 	}
 
 	// 3) Try no password (fresh data dir) -> set root password to 'root'.
-	if tryMySQLCommand(mysqlClient, socketPath, "", "", "ALTER USER 'root'@'localhost' IDENTIFIED BY 'root'; FLUSH PRIVILEGES;") {
+	if tryMySQLCommand(mysqlClient, mySQLPort, "", "", "ALTER USER 'root'@'localhost' IDENTIFIED BY 'root'; FLUSH PRIVILEGES;") {
 		fmt.Println("mysql: root password set to 'root' (was empty)")
 		return
 	}
@@ -2261,11 +2253,9 @@ func ensureMySQLRootCredentials(socketPath string) {
 }
 
 // tryMySQLCommand runs the mysql client with the given credentials and a
-// SQL payload, returning true on success. Empty user means no -u flag and
-// empty password means no -p flag (so the client tries password-less login).
-// It returns true only if the command exited 0.
-func tryMySQLCommand(client, socket, user, pass, sql string) bool {
-	args := []string{"-S", socket}
+// SQL payload over TCP, returning true on success.
+func tryMySQLCommand(client, port, user, pass, sql string) bool {
+	args := []string{"-h", "127.0.0.1", "-P", port}
 	if user != "" {
 		args = append(args, "-u", user)
 	}
@@ -2274,6 +2264,7 @@ func tryMySQLCommand(client, socket, user, pass, sql string) bool {
 	}
 	args = append(args, "-e", sql)
 	cmd := exec.Command(client, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		fmt.Printf("mysql: attempt with user=%q pass_set=%v failed: %s: %s\n",
@@ -2284,11 +2275,8 @@ func tryMySQLCommand(client, socket, user, pass, sql string) bool {
 }
 
 // forceRootPasswordViaGrantTables starts a temporary mysqld with
-// --skip-grant-tables --skip-networking (so anyone can connect without a
-// password, but only via the Unix socket, no network exposure), runs SQL to
-// set root@localhost's password to 'root', then stops the temporary mysqld.
-// The main mysqld continues running unaffected because we use a one-off
-// temp socket file.
+// --skip-grant-tables on an isolated port, runs SQL to set root@localhost's password to 'root',
+// then stops the temporary mysqld.
 func forceRootPasswordViaGrantTables() error {
 	binaryPath, err := mysqldPath()
 	if err != nil {
@@ -2303,39 +2291,30 @@ func forceRootPasswordViaGrantTables() error {
 		return err
 	}
 
-	// Use a separate socket so the temp mysqld does not conflict with the
-	// running main mysqld's socket.
-	tempSocket := filepath.Join(dataDir, "grant-reset.sock")
-	_ = os.Remove(tempSocket)
-
+	tempPort := "3310"
 	mysqld := exec.Command(binaryPath,
-		"--datadir="+dataDir,
-		"--socket="+tempSocket,
+		"--datadir="+filepath.Clean(dataDir),
+		"--port="+tempPort,
 		"--skip-grant-tables",
-		"--skip-networking",
 	)
+	mysqld.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	if err := mysqld.Start(); err != nil {
 		return fmt.Errorf("cannot start temp mysqld: %w", err)
 	}
 	defer func() {
 		_ = mysqld.Process.Kill()
-		_ = os.Remove(tempSocket)
+		_ = killProcessByPID(mysqld.Process.Pid)
 	}()
 
-	// Wait for temp socket to appear.
-	for i := 0; i < 80; i++ {
-		if _, err := os.Stat(tempSocket); err == nil {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	if _, err := os.Stat(tempSocket); err != nil {
-		return fmt.Errorf("temp mysqld socket never appeared")
+	// Wait for temp port to appear.
+	if !waitForPort(tempPort, 5000*time.Millisecond) {
+		return fmt.Errorf("temp mysqld port %s never appeared", tempPort)
 	}
 
 	// skip-grant-tables means no password is needed AND ALTER USER works.
 	sql := "FLUSH PRIVILEGES; ALTER USER 'root'@'localhost' IDENTIFIED BY 'root'; FLUSH PRIVILEGES;"
-	cmd := exec.Command(mysqlClient, "-S", tempSocket, "-e", sql)
+	cmd := exec.Command(mysqlClient, "-h", "127.0.0.1", "-P", tempPort, "-e", sql)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("could not set root password via grant tables: %s: %s", err.Error(), strings.TrimSpace(string(out)))
