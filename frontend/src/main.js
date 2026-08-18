@@ -76,7 +76,7 @@ document.querySelector('#app').innerHTML = `
                                 <option value="8.5">PHP 8.5</option>
                             </select>
                         </div>
-                        <div class="port-info">Port: 8000</div>
+                        <div class="port-info">Port: 9000</div>
                     </div>
                 </div>
                 <button class="btn" id="btn-web">Start</button>
@@ -93,7 +93,7 @@ document.querySelector('#app').innerHTML = `
                                 <option>MySQL 5.7</option>
                             </select>
                         </div>
-                        <div class="port-info">Port: 3307 • User: root • Pass: root</div>
+                        <div class="port-info">Port: 3309 • User: root • Pass: root</div>
                     </div>
                 </div>
                 <button class="btn" id="btn-mysql">Start</button>
@@ -434,7 +434,7 @@ adminerBtn.addEventListener('click', () => {
 
 htdocsBtn.addEventListener('click', () => {
     OpenHtdocsFolder()
-        .then(() => showToast('Opened htdocs folder in Finder.', false))
+        .then(() => showToast('Opened htdocs folder in File Explorer.', false))
         .catch((err) => {
             const msg = typeof err === 'string' ? err : String(err);
             showToast(msg, true);
